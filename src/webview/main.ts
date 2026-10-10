@@ -199,7 +199,29 @@ function handleInit(msg: Extract<HostMsg, { type: "init" }>): void {
   view = editorHandle.view;
   ensureThemeObserver();
   syncThemeMode();
+  // The frame may already hold focus by the time init arrives (VS Code focuses
+  // a webview as soon as its tab opens).
+  focusEditorIfFrameFocused();
 }
+
+// ---------------------------------------------------------------------------
+// Frame focus → editor focus. Opening or switching to the tab makes VS Code
+// focus this webview's window, but no element inside it, so CM6's keymap (Mod-F
+// find, typing) sees nothing until the user clicks into the text. Pass that
+// focus on to the editor, as VS Code's built-in text editor does.
+// ---------------------------------------------------------------------------
+
+function focusEditorIfFrameFocused(): void {
+  if (!view || view.hasFocus || !document.hasFocus()) return;
+  // Leave focus that already sits on something else (find input, table cell).
+  const active = document.activeElement;
+  if (active && active !== document.body && active !== document.documentElement) return;
+  view.focus();
+}
+
+window.addEventListener("focus", (event) => {
+  if (event.target === window) focusEditorIfFrameFocused();
+});
 
 // ---------------------------------------------------------------------------
 // applyEdit: reconcile external deltas into CM6 without re-sending
