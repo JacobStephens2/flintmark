@@ -196,6 +196,17 @@ try {
     assert.ok(count > 0, "expected a CM6 .cm-content");
   });
 
+  // Runs before any test clicks into the text: like the built-in text editor,
+  // a freshly opened Live Preview tab takes keys straight away.
+  await test("Mod-F opens find right after opening, without a click", async () => {
+    await win.waitForTimeout(500);
+    await win.keyboard.press("Control+f");
+    const panel = cm.locator(".cm-panel.cm-search");
+    await panel.first().waitFor({ state: "visible", timeout: 4000 });
+    await win.keyboard.press("Escape");
+    await panel.first().waitFor({ state: "detached", timeout: 4000 });
+  });
+
   await test("markers hidden when cursor is not in the construct", async () => {
     // Click the last (plain) line so the cursor is away from heading/bold.
     await cm.locator(".cm-line").last().click();
