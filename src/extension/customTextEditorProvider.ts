@@ -898,6 +898,20 @@ export class OfmCustomTextEditorProvider
     return true;
   }
 
+  /**
+   * Mod-F with focus outside the webview (Explorer single-click keeps focus in
+   * the tree). VS Code's own Find runs for any open text editor, but never
+   * reaches a custom editor, so focus the active Live Preview and open its find.
+   */
+  public openFindOnActivePanel(): boolean {
+    const panel = this.activePanel();
+    if (!panel) return false;
+    panel.reveal(undefined, false);
+    const msg: HostMsg = { type: "openFind" };
+    void panel.webview.postMessage(msg);
+    return true;
+  }
+
   // -----------------------------------------------------------------------
   // Image resolution: map raw `![](src)` paths to webview-safe URIs
   // -----------------------------------------------------------------------

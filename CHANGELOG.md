@@ -20,8 +20,9 @@ the editor stabilizes for the Marketplace.
   checks the Zed Rust/WASM adapter and runs an end-to-end LSP protocol smoke
   test alongside the shared parser tests.
 - **Keyboard focus on open.** A Live Preview tab now takes keyboard focus as
-  soon as it opens or is switched to, so Cmd/Ctrl+F (and typing) works without
-  clicking into the text first, matching the built-in text editor.
+  soon as it opens or is switched to, and Cmd/Ctrl+F opens find even while
+  focus is still in the Explorer after a single-click, matching the built-in
+  text editor. No click into the text needed first.
 
 ## 0.32.13
 

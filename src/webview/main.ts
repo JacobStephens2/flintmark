@@ -6,6 +6,7 @@ import "katex/dist/katex.min.css";
 import "./theme/obsidian-variables.css";
 import "./theme/obsidian-base.css";
 import { EditorView } from "@codemirror/view";
+import { openSearchPanel } from "@codemirror/search";
 import type {
   DocVersion,
   HostMsg,
@@ -118,6 +119,10 @@ messenger.onMessage((msg: HostMsg) => {
       break;
     case "revealPosition":
       handleRevealPosition(msg.line, msg.character);
+      break;
+    case "openFind":
+      // Opens the panel, or focuses + selects its input if already open.
+      if (view) openSearchPanel(view);
       break;
     case "conflict":
       handleConflict(msg.serverVersion);
