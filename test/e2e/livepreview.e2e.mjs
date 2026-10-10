@@ -1505,6 +1505,9 @@ try {
     await win.keyboard.press("Control+f");
     const panel = frame.locator(".cm-panel.cm-search");
     await panel.first().waitFor({ state: "visible", timeout: 4000 });
+    await win.waitForTimeout(300);
+    const active = await frame.evaluate(() => document.activeElement?.getAttribute("name") ?? "");
+    assert.equal(active, "search", "keyboard focus should be in the find input, not the text");
     await win.keyboard.type("explorer-find");
     await win.waitForTimeout(200);
     assert.equal(await panel.locator("input[name='search']").first().inputValue(), "explorer-find");

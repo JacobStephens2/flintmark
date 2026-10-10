@@ -121,8 +121,7 @@ messenger.onMessage((msg: HostMsg) => {
       handleRevealPosition(msg.line, msg.character);
       break;
     case "openFind":
-      // Opens the panel, or focuses + selects its input if already open.
-      if (view) openSearchPanel(view);
+      handleOpenFind();
       break;
     case "conflict":
       handleConflict(msg.serverVersion);
@@ -224,8 +223,38 @@ function focusEditorIfFrameFocused(): void {
   view.focus();
 }
 
+// Set by openFind until this frame holds focus: the host reveals the panel and
+// posts openFind together, and the frame's focus can land after the message.
+let findFocusPending = false;
+
+function focusSearchInput(): boolean {
+  const input = view?.dom.querySelector<HTMLInputElement>(".cm-search input[name='search']");
+  if (!input) return false;
+  input.focus();
+  input.select();
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// openFind: Mod-F pressed outside the webview (host keybinding). CM6's panel
+// only select()s its input on mount — it expects the key to come from the
+// focused editor — so put focus in the input explicitly.
+// ---------------------------------------------------------------------------
+
+function handleOpenFind(): void {
+  if (!view) return;
+  openSearchPanel(view);
+  focusSearchInput();
+  findFocusPending = !document.hasFocus();
+}
+
 window.addEventListener("focus", (event) => {
-  if (event.target === window) focusEditorIfFrameFocused();
+  if (event.target !== window) return;
+  if (findFocusPending) {
+    findFocusPending = false;
+    if (focusSearchInput()) return;
+  }
+  focusEditorIfFrameFocused();
 });
 
 // ---------------------------------------------------------------------------
