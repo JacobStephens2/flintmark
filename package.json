@@ -128,7 +128,7 @@
         "command": "ofm.find",
         "key": "ctrl+f",
         "mac": "cmd+f",
-        "when": "activeCustomEditorId == 'ofm.livePreview' && !inputFocus && !terminalFocus && !panelFocus"
+        "when": "activeCustomEditorId == 'ofm.livePreview' && !editorAreaFocus && !inputFocus && !terminalFocus && !panelFocus"
       }
     ],
     "configuration": {

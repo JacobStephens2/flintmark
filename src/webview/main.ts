@@ -236,16 +236,23 @@ function focusSearchInput(): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// openFind: Mod-F pressed outside the webview (host keybinding). CM6's panel
-// only select()s its input on mount — it expects the key to come from the
-// focused editor — so put focus in the input explicitly.
+// openFind: Mod-F via the host keybinding. CM6's panel only select()s its
+// input on mount — it expects the key to come from the focused editor — so put
+// focus in the input explicitly.
 // ---------------------------------------------------------------------------
 
 function handleOpenFind(): void {
   if (!view) return;
+  // Mod-F inside the webview reaches CM6 first, and VS Code also forwards it to
+  // the keybinding, so this can arrive after the user is already typing a query
+  // (seconds later over Remote). Re-selecting would eat their next keystroke.
+  if (document.hasFocus() && view.dom.querySelector(".cm-search input[name='search']") === document.activeElement) return;
   openSearchPanel(view);
-  focusSearchInput();
+  // Only take focus inside a frame that holds it; otherwise CM6's mount has
+  // already made the input the active element and the window focus handler
+  // finishes the job when the host's focus arrives.
   findFocusPending = !document.hasFocus();
+  if (!findFocusPending) focusSearchInput();
 }
 
 window.addEventListener("focus", (event) => {

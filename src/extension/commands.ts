@@ -15,7 +15,7 @@ export interface AiPanelHost {
 
 /** Minimal surface the find command needs from the editor provider. */
 export interface FindPanelHost {
-  openFindOnActivePanel(): boolean;
+  openFindOnActivePanel(): Promise<boolean>;
 }
 
 export function registerCommands(
@@ -80,8 +80,8 @@ export function registerCommands(
   });
 
   // Bound to Mod-F while a Live Preview is the active editor (package.json).
-  reg("ofm.find", () => {
-    if (!panelHost?.openFindOnActivePanel()) {
+  reg("ofm.find", async () => {
+    if (!(await panelHost?.openFindOnActivePanel())) {
       vscode.window.showInformationMessage(
         "Flintmark: open a Markdown file in Live Preview first."
       );
