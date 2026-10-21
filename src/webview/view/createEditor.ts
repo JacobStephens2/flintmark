@@ -280,20 +280,27 @@ export function createEditor(
   // Live Preview has layout-affecting decorations (headings, code block boxes,
   // tables). For documents below the decoration cutoff, publish a complete
   // syntax tree before the user starts fast-scrolling so CM6 does not have to
-  // adjust the height map while the viewport is moving.
+  // adjust the height map while the viewport is moving. Wait until after the
+  // first paint, so a long note shows its text before the full parse runs.
   if (initialText.length <= LIVE_PREVIEW_DECORATION_CHAR_LIMIT) {
-    const parsedOnOpen = forceParsing(
-      view,
-      view.state.doc.length,
-      FORCE_PARSE_ON_OPEN_TIMEOUT_MS
-    );
-    if (!parsedOnOpen) {
+    requestAnimationFrame(() =>
       setTimeout(() => {
-        if (view.state.doc.length <= LIVE_PREVIEW_DECORATION_CHAR_LIMIT) {
-          forceParsing(view, view.state.doc.length, 100);
+        if (!view.dom.isConnected) return;
+        if (view.state.doc.length > LIVE_PREVIEW_DECORATION_CHAR_LIMIT) return;
+        const parsedOnOpen = forceParsing(
+          view,
+          view.state.doc.length,
+          FORCE_PARSE_ON_OPEN_TIMEOUT_MS
+        );
+        if (!parsedOnOpen) {
+          setTimeout(() => {
+            if (view.state.doc.length <= LIVE_PREVIEW_DECORATION_CHAR_LIMIT) {
+              forceParsing(view, view.state.doc.length, 100);
+            }
+          }, 0);
         }
-      }, 0);
-    }
+      }, 0)
+    );
   }
 
   // Floating selection toolbar (Edit with AI / Add to Chat) — created after the
