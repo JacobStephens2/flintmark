@@ -19,6 +19,7 @@ const webviewConfig = {
   platform: 'browser',
   format: 'iife',
   outfile: path.join(outputRoot, 'webview.js'),
+  minify: true,
   // KaTeX CSS is imported in main.ts → emits out/webview.css; its fonts are
   // copied to out/ (the "file" loader) and the url()s are rewritten to relative
   // paths that resolve under the extension's webview resource root.
