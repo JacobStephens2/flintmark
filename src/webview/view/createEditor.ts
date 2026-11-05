@@ -1,8 +1,5 @@
-import {
-  EditorView,
-  keymap,
-  ViewUpdate,
-} from "@codemirror/view";
+import { collab } from "@codemirror/collab";
+import { EditorView, keymap, ViewUpdate } from "@codemirror/view";
 import {
   EditorSelection,
   EditorState,
@@ -24,8 +21,11 @@ import {
   markdownDecorationsPlugin,
   blockWidgetsField,
   LIVE_PREVIEW_DECORATION_CHAR_LIMIT,
+  armRevealExtender,
+  revealArmedField,
 } from "./markdownDecorations";
 import { createAiButton, type AiButtonHandle } from "./aiSelectionButton";
+import { tableLinkFacet } from "./widgets/tableWidget";
 import { markdownTheme } from "./markdownTheme";
 import { taskToggleFacet } from "./widgets/checkboxWidget";
 import { imageMapField } from "./widgets/imageWidget";
@@ -65,6 +65,8 @@ export const hostOrigin = Annotation.define<boolean>();
 export interface EditorCallbacks {
   /** Called for user-originated document changes (NOT host-originated). */
   onUserEdit: (changes: DocChange[]) => void;
+  /** Called when the user presses Mod-s (save) — flush edits before saving. */
+  onRequestSave: () => void;
   /** Called when the user presses Mod-z (undo) — relay to host. */
   onRequestUndo: () => void;
   /** Called when the user presses Mod-Shift-z or Mod-y (redo) — relay to host. */
@@ -116,7 +118,7 @@ export function createEditor(
   parent: HTMLElement,
   initialText: string,
   callbacks: EditorCallbacks,
-  options: { dark: boolean }
+  options: { dark: boolean; syncVersion?: number },
 ): EditorHandle {
   const undoRedoKeymap = keymap.of([
     {
@@ -126,6 +128,7 @@ export function createEditor(
         return true;
       },
       preventDefault: true,
+      stopPropagation: true,
     },
     {
       key: "Mod-Shift-z",
@@ -134,6 +137,7 @@ export function createEditor(
         return true;
       },
       preventDefault: true,
+      stopPropagation: true,
     },
     {
       key: "Mod-y",
@@ -142,6 +146,7 @@ export function createEditor(
         return true;
       },
       preventDefault: true,
+      stopPropagation: true,
     },
   ]);
 
@@ -154,6 +159,18 @@ export function createEditor(
       doc: initialText,
       selection: EditorSelection.cursor(initialSelectionAnchor(initialText)),
       extensions: [
+        collab({ startVersion: options.syncVersion ?? 0 }),
+        keymap.of([
+          {
+            key: "Mod-s",
+            run: () => {
+              callbacks.onRequestSave();
+              return true;
+            },
+            preventDefault: true,
+      stopPropagation: true,
+          },
+        ]),
         // Markdown-aware Enter/Backspace: continue list/quote markers on Enter,
         // and remove them on Backspace at the line start (before defaultKeymap
         // so these win for those keys).
@@ -175,7 +192,12 @@ export function createEditor(
         // In-editor find/replace (Mod-F / Mod-Alt-F) — VS Code's native Find
         // can't reach into the webview, so the editor provides its own.
         search({ top: true }),
-        keymap.of(searchKeymap),
+        // Keep a locally handled Find shortcut inside the webview. The host also
+        // forwards keydowns, which otherwise runs ofm.find a second time and
+        // moves focus away from the search input during the next keystroke.
+        keymap.of(searchKeymap.map((binding) =>
+          binding.key === "Mod-f" ? { ...binding, stopPropagation: true } : binding
+        )),
 
         EditorView.lineWrapping,
 
@@ -200,6 +222,12 @@ export function createEditor(
         // Live Preview: hide markers, style headings, apply inline styling.
         markdownDecorationsPlugin,
 
+        // Reveal arming: a freshly opened document renders fully (the initial
+        // selection does not reveal source); the first user selection or edit
+        // arms the cursor-based Reveal rule. See markdownDecorations.ts.
+        revealArmedField,
+        EditorState.transactionExtender.of(armRevealExtender),
+
         // Block widgets (mermaid diagrams, tables) — must be a StateField.
         // Tables stay as source until this per-view field receives a precise
         // measurement for the current layout signature.
@@ -214,6 +242,7 @@ export function createEditor(
 
         // Provide the task-toggle callback to checkbox widgets.
         taskToggleFacet.of(callbacks.onToggleTask),
+        tableLinkFacet.of(callbacks.onOpenLink),
 
         // Click a link (wiki [[…]] or external [text](url) / <url>) → ask the
         // host to open it. The host decides internal-note vs external-URL.
@@ -268,7 +297,8 @@ export function createEditor(
           }
           if (!update.docChanged) return;
           for (const tr of update.transactions) {
-            if (tr.annotation(hostOrigin)) continue;
+            if (tr.annotation(hostOrigin) || tr.annotation(Transaction.remote))
+              continue;
             callbacks.onUserEdit(extractChanges(tr));
           }
         }),
@@ -280,27 +310,20 @@ export function createEditor(
   // Live Preview has layout-affecting decorations (headings, code block boxes,
   // tables). For documents below the decoration cutoff, publish a complete
   // syntax tree before the user starts fast-scrolling so CM6 does not have to
-  // adjust the height map while the viewport is moving. Wait until after the
-  // first paint, so a long note shows its text before the full parse runs.
+  // adjust the height map while the viewport is moving.
   if (initialText.length <= LIVE_PREVIEW_DECORATION_CHAR_LIMIT) {
-    requestAnimationFrame(() =>
-      setTimeout(() => {
-        if (!view.dom.isConnected) return;
-        if (view.state.doc.length > LIVE_PREVIEW_DECORATION_CHAR_LIMIT) return;
-        const parsedOnOpen = forceParsing(
-          view,
-          view.state.doc.length,
-          FORCE_PARSE_ON_OPEN_TIMEOUT_MS
-        );
-        if (!parsedOnOpen) {
-          setTimeout(() => {
-            if (view.state.doc.length <= LIVE_PREVIEW_DECORATION_CHAR_LIMIT) {
-              forceParsing(view, view.state.doc.length, 100);
-            }
-          }, 0);
-        }
-      }, 0)
+    const parsedOnOpen = forceParsing(
+      view,
+      view.state.doc.length,
+      FORCE_PARSE_ON_OPEN_TIMEOUT_MS
     );
+    if (!parsedOnOpen) {
+      setTimeout(() => {
+        if (view.state.doc.length <= LIVE_PREVIEW_DECORATION_CHAR_LIMIT) {
+          forceParsing(view, view.state.doc.length, 100);
+        }
+      }, 0);
+    }
   }
 
   // Floating selection toolbar (Edit with AI / Add to Chat) — created after the

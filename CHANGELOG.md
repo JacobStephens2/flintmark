@@ -5,24 +5,81 @@ the editor stabilizes for the Marketplace.
 
 ## Unreleased
 
+## 0.33.2
+
+- **Large-workspace indexing.** Local note reads now run directly in the extension host instead of making a file-service IPC request for every file. This removes the Windows indexing bottleneck observed in the 20,000-note stress test. Remote and custom file systems continue to use their registered providers. The same routing applies to incremental updates.
+
+- **Release acceptance.** Every release now tests one packaged VSIX on Ubuntu x64, Windows x64, Windows ARM64, and macOS ARM64 in VS Code, VSCodium, and Cursor. Publication requires all 12 combinations and the quality checks to pass; the accepted package is published without rebuilding it.
+
+- **Test reliability.** Integration checks independently validate Mocha results even when an editor exits successfully after test failures. GUI tests wait for the visible preview, preserve real tab lifecycle assertions, and avoid first-run welcome screens intercepting input.
+
+### Validation scope
+
+The release gate covers 13 stages per editor, including image paths, CRLF editing, multiple-pane synchronization, scrolling, 14 large or adversarial Markdown fixtures with 42 edit/save checks, and a workspace with 20,000 notes and 4,200 images under continuous file creation and deletion. Linux and macOS also receive local acceptance. Windows validation uses GitHub-hosted runners; local Windows full release testing was not completed because of test-device availability constraints. Antigravity remains outside GUI acceptance because account login is out of scope.
+
+### Contributors
+
+Thanks again to [@Fujita0113](https://github.com/Fujita0113) for the CRLF fix in [#18](https://github.com/quboliu/flintmark/pull/18) and the Windows image and multiple-pane reports that helped drive this cross-platform validation. The original contribution remains in the commit history.
+
+## 0.33.1
+
+- **Typing synchronization.** Consecutive queued input batches from the same pane are combined before native submission, reducing backlog on slower hosts while preserving command order, concurrent-pane edits, and recovery after a rejected edit.
+
+- **Heading-fold performance.** Layout refreshes scan only the requested section and reuse fold ranges while the document is unchanged, avoiding repeated whole-document copies for every heading.
+
+- **Search input.** Select All in Find and Replace completes locally, preventing a delayed host shortcut from selecting and overwriting newly typed query characters.
+
+- **Stable reading position.** Font and width changes preserve the visible source block when long notes grow or shrink. Repeated layout changes retain fractional positioning, and new scrolling or navigation takes precedence over pending layout restoration. Scrolling that arrives during a layout measurement is preserved as well, including when the document shrinks at the bottom.
+
+- **Large-document structure.** Outline and Todo skip unused inline syntax trees while extracting headings and tasks, reducing synchronous parsing work without changing source positions or rendered Markdown.
+
+- **Checkbox focus.** Clicking a task checkbox focuses Live Preview without moving the selection, so immediate Save and Undo use the pending-edit queue. Keyboard activation keeps its existing focus behavior.
+
+- **Find focus.** Opening Find inside Live Preview no longer runs the shortcut twice, so immediate typing and Escape keep working without a focus jump.
+
+- **Windows images.** Local images render when VS Code reports different drive-letter casing for the workspace and scanned files, including image-only notes without a trailing newline.
+
+- **Multiple Live Preview panes.** Concurrent edits to the same note are rebased and acknowledged per pane, preserving changes made before another pane catches up. Identical concurrent insertions remain separate edits, and LF/CRLF conversion no longer moves pending input.
+- **Synchronization recovery.** Transient edit conflicts retry automatically. Persistent conflicts offer Retry or an unsaved recovery copy; edits retained during the session can be recovered even after closing their preview.
+- **Todo navigation.** Source-view navigation reuses an existing hidden preview in its original editor group, avoiding stale or duplicate tabs.
+- **Save and undo after typing.** Keyboard save, undo, and redo wait for the pane's pending edits to synchronize. Switching between LF and CRLF preserves live-pane positions.
+- **Editing CRLF notes.** Typing, Backspace, task toggles and AI selections in Live Preview now land at the cursor in Windows-style (CRLF) notes instead of shifting by the number of preceding line breaks.
+
+### Validation scope
+
+Linux and macOS completed release acceptance in VS Code, VSCodium, and Cursor, including large-file editing and the 20,000-note / 4,200-image workspace stress test. Files above the Live Preview size limit use the intentional source-text fallback.
+
+Windows: full release testing was not completed because of test-device availability constraints. Antigravity was excluded from GUI acceptance because account login was out of scope.
+
+### Contributors
+
+Thanks to [@Fujita0113](https://github.com/Fujita0113) for the CRLF editing fix in [#18](https://github.com/quboliu/flintmark/pull/18) and for reporting the Windows image and multiple-pane synchronization issues. The original contribution is retained in the commit history.
+
+## 0.33.0
+
+- **Windows outlines.** CRLF headings retain their titles and hierarchy, with source offsets preserved.
+- **Local note links.** Explicit .md/.markdown paths and percent-encoded filenames resolve relative to the current note before vault-wide lookup. Rendered table links now navigate without entering cell editing.
+- **Variable names in tables.** Underscores inside identifiers remain literal; explicit underscore emphasis still renders.
+- **Busy workspace indexing.** Superseded searches are cancelled, scans serialize per index/root, and unrelated deletions stop rebuilding completed indexes. Initial scans finish before ambiguous deletion reconciliation.
+
+- **A freshly opened document renders in full until you interact.** Opening a
+  note used to reveal raw Markdown for whatever construct the initial cursor
+  landed on — most visible when line 1 is an image, which opened as
+  `![alt](path)` instead of the image. The editor now starts unarmed: the whole
+  note renders until the first selection or edit, after which the cursor-based
+  Reveal rule applies unchanged. Host-driven reveals (Go to Symbol, Reveal in
+  Explorer, search jumps) arm the editor immediately.
 - **Catppuccin theme.** Select `catppuccin` via **Flintmark: Select Theme** or
   `ofm.theme` for Obsidian-inspired pastel colors: Latte in light mode and Mocha
   in dark mode. Theme changes apply live to open editors.
-- **Zed developer preview.** A native Zed extension adapter now exposes
-  Flintmark's vault intelligence through LSP: wikilink/tag/heading/block
-  completion, definition and reference navigation, backlinks, hover/document
-  links, heading/task Outline symbols, workspace symbols, and Obsidian-oriented
-  snippets. It uses Zed's built-in Markdown preview because Zed does not yet
-  expose a custom-editor or webview API.
-- **Coordinated multi-editor releases.** One version tag now validates both
-  manifests and produces the VSIX, a downloadable Zed language-server bundle,
-  a Zed dev-extension archive, and checksums on the same GitHub Release. CI
-  checks the Zed Rust/WASM adapter and runs an end-to-end LSP protocol smoke
-  test alongside the shared parser tests.
 - **Keyboard focus on open.** A Live Preview tab now takes keyboard focus as
   soon as it opens or is switched to, and Cmd/Ctrl+F opens find even while
   focus is still in the Explorer after a single-click, matching the built-in
   text editor. No click into the text needed first.
+
+### Contributors
+
+Thanks to @iljasorokin (#4), @rubenxyz (#6), and @JacobStephens2 (#9, #12 and the indexing fix for #13). Their original contributions are retained in this release.
 
 ## 0.32.13
 

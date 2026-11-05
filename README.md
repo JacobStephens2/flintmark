@@ -30,7 +30,9 @@
 
 Flintmark is a custom Markdown editor for VS Code. It renders formatting in the
 document and reveals the source around the caret, so editing and previewing
-happen in the same tab. The file on disk is still an ordinary `.md` file.
+happen in the same tab. A freshly opened note renders in full until you click
+or type — the initial cursor position never opens the file showing raw source.
+The file on disk is still an ordinary `.md` file.
 
 It also adds the pieces that are usually missing when an Obsidian vault is
 opened in VS Code: wikilink and tag completion, Properties, image embeds,
@@ -226,22 +228,6 @@ To set the association by hand:
 }
 ```
 
-### Zed developer preview
-
-The repository also contains a native Zed extension adapter in
-[`editors/zed`](editors/zed). It adds vault-wide wikilink/tag completion,
-definition and reference navigation (including backlinks), heading/task
-symbols, document links, and Obsidian-oriented snippets to Zed's built-in
-Markdown editor. Use Zed's own `markdown: open preview to the side` action for
-rendered output.
-
-This is not full UI parity with the VS Code edition: Zed does not currently
-expose a custom-editor/webview API, so Flintmark cannot place its caret-aware
-Live Preview, interactive widgets, or custom sidebars inside Zed. The adapter
-is ready for development installation now; registry publication follows the
-first coordinated release. See the [Zed README](editors/zed/README.md) for the
-exact feature and install details.
-
 ## Settings
 
 | Setting | Default | Description |
@@ -291,7 +277,6 @@ npm run lint
 npx tsc --noEmit -p .
 npm run test:unit
 npm run test:perf
-npm run test:zed
 npm run test:e2e
 ```
 
