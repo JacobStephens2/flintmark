@@ -194,8 +194,13 @@ try {
     await win.waitForTimeout(waitAfterClick);
   }
 
-  await palette("Control+P", "alpha.md");
-  let alphaFrame = await findCmFrameContaining("alpha tail");
+  // The CLI/readiness gate may already have opened alpha. Quick Open here can
+  // interrupt its first webview mount on a cold runner.
+  const activeTabNames = await win.locator(".tab.active .label-name").allTextContents();
+  if (!activeTabNames.some(name => name.trim() === "alpha.md")) {
+    await palette("Control+P", "alpha.md");
+  }
+  let alphaFrame = await findCmFrameContaining("alpha tail", 30000);
   if (!alphaFrame) {
     const initial = await captureTriage("alpha-initial-open-failure", { file: "alpha.md" });
     let repaired = false;
