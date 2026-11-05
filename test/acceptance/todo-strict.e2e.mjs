@@ -196,8 +196,8 @@ try {
 
   // The CLI/readiness gate may already have opened alpha. Quick Open here can
   // interrupt its first webview mount on a cold runner.
-  const activeTabNames = await win.locator(".tab.active .label-name").allTextContents();
-  if (!activeTabNames.some(name => name.trim() === "alpha.md")) {
+  const alphaIsActive = await win.locator('.tab.active[data-resource-name="alpha.md"]').count() > 0;
+  if (!alphaIsActive) {
     await palette("Control+P", "alpha.md");
   }
   let alphaFrame = await findCmFrameContaining("alpha tail", 30000);

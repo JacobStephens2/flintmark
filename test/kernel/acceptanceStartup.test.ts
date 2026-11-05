@@ -87,7 +87,7 @@ async function nativeWindow({ platform = "win32", executable = "", sizingErrors 
     get sizes() { return sizes; }, get waits() { return waits; } };
 }
 
-async function todoStartup({ active = true, mountDelay = 20000, live = true } = {}) {
+async function todoStartup({ active = true, mountDelay = 20000, live = true, tabLabel = "alpha.md" } = {}) {
   let now = 0;
   let closed = false;
   let initialFailureAt: number | undefined;
@@ -109,10 +109,13 @@ async function todoStartup({ active = true, mountDelay = 20000, live = true } = 
       locator, first() { return this; }, nth() { return this; },
       async waitFor() {},
       async isVisible() { return selector === ".antigravity-ide-welcome-button" ? false : live && now >= mountAt; },
-      async count() { return live && now >= mountAt ? 1 : 0; },
+      async count() {
+        if (selector === '.tab.active[data-resource-name="alpha.md"]') return active ? 1 : 0;
+        return live && now >= mountAt ? 1 : 0;
+      },
       async innerText() { return selector === ".cm-content" ? "alpha tail" : choiceName(); },
       async allInnerTexts() { return []; },
-      async allTextContents() { return active ? ["alpha.md"] : []; },
+      async allTextContents() { return active ? [tabLabel] : []; },
       async inputValue() { return query; },
       async fill(value: string) { query = value; },
       async evaluateAll(callback: (elements: object[]) => object) { return callback([row]); },
@@ -213,6 +216,12 @@ async function run() {
     const result = await todoStartup({ mountDelay: 29750 });
     assert.ok(result.error === result.reachedTodo, String(result.error));
     assert.deepEqual(result.selected, []);
+  });
+
+  await test("CLI alpha with a separate extension suffix is not reopened", async () => {
+    const result = await todoStartup({ tabLabel: "alpha" });
+    assert.ok(result.error === result.reachedTodo, String(result.error));
+    assert.deepEqual(result.selected, [], "active alpha.md must not be reopened when its label-name is alpha");
   });
 
   await test("Quick Open still selects alpha when the CLI editor is not active", async () => {
