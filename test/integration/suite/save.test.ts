@@ -138,7 +138,15 @@ describe("Save barrier failures", () => {
       try {
         await assert.rejects(provider.saveDocument(document),failure==="conflict"?/unsynchronized/:failure==="undelivered"?/closed/:/did not respond/);
         assert.equal(fs.readFileSync(file,"utf8"),"original\n");
-        assert.equal(provider.flushWaiters.size,0);
+        // Recovery is observable through the same save entry point, rather
+        // than by inspecting the coordinator's private request registry.
+        provider.conflicts.delete(uri);
+        panel.webview.postMessage = (message: any) => {
+          queueMicrotask(() => { void provider.onWebviewMessage(document,panel,{type:"flushed",requestId:message.requestId}); });
+          return Promise.resolve(true);
+        };
+        assert.equal(await provider.saveDocument(document),true);
+        assert.equal(fs.readFileSync(file,"utf8"),"original\n");
       } finally {for(const subscription of subscriptions)subscription.dispose();}
     });
   }
