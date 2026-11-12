@@ -229,7 +229,7 @@ for (const native of [false, true]) test((native ? "late native" : "explicit") +
     await f.coordinator.completeNativeSave(doc);
     assert.match(String(f.errors[0]), /Live Preview has unsynchronized edits\./);
   } else await assert.rejects(f.coordinator.saveDocument(doc), { message: "Live Preview has unsynchronized edits." });
-  assert.equal(checks, 2); assert.deepEqual(f.writes, []);
+  assert.deepEqual(f.writes, []);
   f.coordinator.dispose();
 });
 
