@@ -1,4 +1,5 @@
 import { noteLinkTarget, noteLinkCandidates } from "./noteLinkTarget";
+import { lstat } from "node:fs/promises";
 import * as vscode from "vscode";
 import { LivePreviewEditCoordinator } from "./livePreviewEditCoordinator";
 import { LivePreviewEditHost, hostDocumentChanges } from "./livePreviewEditHost";
@@ -68,6 +69,9 @@ type PanelRecord = {
   document: vscode.TextDocument;
   panel: vscode.WebviewPanel;
 };
+
+/** `vscode.FileType.SymbolicLink`, a bit flag on `FileStat.type`. */
+const FILE_TYPE_SYMBOLIC_LINK = 64;
 
 // ---------------------------------------------------------------------------
 // CustomTextEditorProvider
@@ -604,16 +608,9 @@ export class OfmCustomTextEditorProvider
     const dir = vscode.Uri.joinPath(document.uri, "..");
     const fileUri = vscode.Uri.joinPath(dir, filename);
 
-    // Already on disk (e.g. resolver miss / race) → just open it.
-    let exists = false;
-    try {
-      await vscode.workspace.fs.stat(fileUri);
-      exists = true;
-    } catch {
-      /* not found — we'll offer to create */
-    }
-
-    if (!exists) {
+    // A real non-symlink file is opened. A missing name, or a symlink at that
+    // name, is an exclusive create — the create fails when the name is a symlink.
+    if (!(await this.isExistingNonSymlink(fileUri))) {
       const CREATE = "Create note";
       const choice = await vscode.window.showInformationMessage(
         `"${target}" doesn't exist yet. Create it?`,
@@ -623,9 +620,7 @@ export class OfmCustomTextEditorProvider
       const title = filename.replace(/\.md$/i, "");
       const content = new TextEncoder().encode(`# ${title}\n\n`);
       try {
-        await exclusiveCreate(fileUri, content, (target, data) =>
-          vscode.workspace.fs.writeFile(target, data)
-        );
+        await exclusiveCreate(fileUri, content);
       } catch (e) {
         vscode.window.showErrorMessage(
           `Flintmark: couldn't create ${filename}: ${(e as Error).message}`
@@ -675,13 +670,15 @@ export class OfmCustomTextEditorProvider
     const dir = vscode.Uri.joinPath(document.uri, "..");
     let finalName = name;
     let target = vscode.Uri.joinPath(dir, finalName);
-    for (let i = 1; i < 1000 && (await this.uriExists(target)); i++) {
+    for (let i = 1; i < 1000 && (await this.isExistingNonSymlink(target)); i++) {
       finalName = dedupeName(name, i);
       target = vscode.Uri.joinPath(dir, finalName);
     }
     // The loop can exit at the cap with the last candidate still taken — never
-    // overwrite an existing attachment in that (pathological) case.
-    if (await this.uriExists(target)) {
+    // overwrite an existing attachment in that (pathological) case. A symlink
+    // is not "taken" in that sense: the exclusive create below fails instead
+    // of skipping the link and writing a different name through it.
+    if (await this.isExistingNonSymlink(target)) {
       vscode.window.showErrorMessage(
         "Flintmark: too many attachments with that name — rename and retry."
       );
@@ -689,9 +686,7 @@ export class OfmCustomTextEditorProvider
     }
 
     try {
-      await exclusiveCreate(target, bytes, (uri, data) =>
-        vscode.workspace.fs.writeFile(uri, data)
-      );
+      await exclusiveCreate(target, bytes);
     } catch (e) {
       vscode.window.showErrorMessage(
         `Flintmark: couldn't save attachment: ${(e as Error).message}`
@@ -704,10 +699,20 @@ export class OfmCustomTextEditorProvider
     panel.webview.postMessage(reply);
   }
 
-  private async uriExists(uri: vscode.Uri): Promise<boolean> {
+  /** An existing directory entry that is not a symlink. A symlink returns
+   * false so the caller runs the exclusive create, which fails closed. */
+  private async isExistingNonSymlink(uri: vscode.Uri): Promise<boolean> {
+    if (uri.scheme === "file") {
+      try {
+        const st = await lstat(uri.fsPath);
+        return !st.isSymbolicLink();
+      } catch {
+        return false;
+      }
+    }
     try {
-      await vscode.workspace.fs.stat(uri);
-      return true;
+      const stat = await vscode.workspace.fs.stat(uri);
+      return (stat.type & FILE_TYPE_SYMBOLIC_LINK) === 0;
     } catch {
       return false;
     }

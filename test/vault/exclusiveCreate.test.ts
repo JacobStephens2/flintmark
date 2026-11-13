@@ -10,6 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { exclusiveCreate } from "../../src/extension/vault/exclusiveCreate";
@@ -20,9 +21,6 @@ async function main(): Promise<void> {
   const outside = join(root, "outside");
   mkdirSync(noteDir);
   mkdirSync(outside);
-  const providerWrite = async (): Promise<void> => {
-    throw new Error("file-scheme create must not use the workspace provider");
-  };
   try {
     const secret = join(outside, "secret.txt");
     writeFileSync(secret, "original-secret");
@@ -30,7 +28,7 @@ async function main(): Promise<void> {
     symlinkSync(secret, linked);
     const planted = Buffer.from("forged-image");
     await assert.rejects(
-      exclusiveCreate({ scheme: "file", fsPath: linked }, planted, providerWrite),
+      exclusiveCreate({ scheme: "file", fsPath: linked }, planted),
     );
     assert.equal(readFileSync(secret, "utf8"), "original-secret");
     assert.equal(lstatSync(linked).isSymbolicLink(), true);
@@ -40,7 +38,7 @@ async function main(): Promise<void> {
     const dangling = join(noteDir, "Planted.md");
     symlinkSync(plantedPath, dangling);
     await assert.rejects(
-      exclusiveCreate({ scheme: "file", fsPath: dangling }, Buffer.from("# planted\n"), providerWrite),
+      exclusiveCreate({ scheme: "file", fsPath: dangling }, Buffer.from("# planted\n")),
     );
     assert.throws(() => lstatSync(plantedPath));
     assert.equal(lstatSync(dangling).isSymbolicLink(), true);
@@ -48,7 +46,7 @@ async function main(): Promise<void> {
 
     const free = join(noteDir, "Free note.md");
     const noteBytes = Buffer.from("# Free note\n\n");
-    await exclusiveCreate({ scheme: "file", fsPath: free }, noteBytes, providerWrite);
+    await exclusiveCreate({ scheme: "file", fsPath: free }, noteBytes);
     assert.equal(lstatSync(free).isFile(), true);
     assert.deepEqual(readFileSync(free), noteBytes);
     console.log("  ✓ a free name becomes a new regular file in the note folder");
@@ -56,22 +54,31 @@ async function main(): Promise<void> {
     const occupied = join(noteDir, "Occupied.md");
     writeFileSync(occupied, "kept");
     await assert.rejects(
-      exclusiveCreate({ scheme: "file", fsPath: occupied }, Buffer.from("replaced"), providerWrite),
+      exclusiveCreate({ scheme: "file", fsPath: occupied }, Buffer.from("replaced")),
     );
     assert.equal(readFileSync(occupied, "utf8"), "kept");
     console.log("  ✓ exclusive create fails when the destination name is an existing file and leaves it unchanged");
 
-    const remotePath = join(noteDir, "remote.md");
-    const remoteUri = { scheme: "vscode-remote", fsPath: remotePath };
-    const remoteBytes = Buffer.from("remote-bytes");
-    let written: { uri: typeof remoteUri; bytes: Uint8Array } | undefined;
-    await exclusiveCreate(remoteUri, remoteBytes, async (uri, bytes) => {
-      written = { uri, bytes };
-    });
-    assert.throws(() => lstatSync(remotePath));
-    assert.equal(written?.uri, remoteUri);
-    assert.deepEqual(written?.bytes, remoteBytes);
-    console.log("  ✓ a non-file destination keeps the registered provider and does not create a local file");
+    const remoteLinked = join(noteDir, "Linked.md");
+    symlinkSync(secret, remoteLinked);
+    // A following provider (workspace.fs.writeFile opens with flag "w") must not
+    // be consulted. The extra argument is ignored unless a later change starts
+    // using it to write.
+    const follow = async (uri: { fsPath: string }, bytes: Uint8Array) => {
+      await writeFile(uri.fsPath, bytes);
+    };
+    await assert.rejects(
+      (
+        exclusiveCreate as (
+          uri: { scheme: string; fsPath: string },
+          bytes: Uint8Array,
+          providerWrite: typeof follow
+        ) => Promise<void>
+      )({ scheme: "vscode-remote", fsPath: remoteLinked }, Buffer.from("# planted\n"), follow)
+    );
+    assert.equal(readFileSync(secret, "utf8"), "original-secret");
+    assert.equal(lstatSync(remoteLinked).isSymbolicLink(), true);
+    console.log("  ✓ exclusive create fails when a non-file destination name is a symlink and does not follow it");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
