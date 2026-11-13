@@ -103,6 +103,14 @@ export class LivePreviewEditCoordinator<Document extends EditDocument, Peer exte
   observe(document: Document, changes: readonly HostDocumentChange[]): void {
     const key = document.uri.toString(), authority = this.authorities.get(key);
     const snapshot = this.options.host.read(document);
+    if (authority && this.documents.get(authority) !== document && !this.pending.has(key)) {
+      const priorCrlf = authority.crlf;
+      // A source editor may emit the new incarnation's first event before a
+      // preview initializes. Preserve old recovery before touching its history.
+      if (this.authority(document, snapshot) !== authority) return;
+      // A preserved history still converts pre-event offsets in its prior EOL.
+      authority.crlf = priorCrlf;
+    }
     if (authority) {
       if (!changes.length && authority.crlf === snapshot.crlf) return;
       const event = { ...snapshot, text: normalized(snapshot.text), changes: changes.map(change => ({ ...change })) };

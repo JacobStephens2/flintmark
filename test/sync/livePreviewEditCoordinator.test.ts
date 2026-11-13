@@ -81,6 +81,7 @@ function fixture() {
   }
   function change(doc: Document, changes: readonly DocChange[], crlf = doc.crlf) {
     const before = doc.text, cm = normalized(before);
+    for (const ch of changes) assert.ok(ch.from >= 0 && ch.from <= ch.to && ch.to <= cm.length, "in-memory host receives valid ranges");
     const offsets = doc.crlf ? cmToHostOffsets(before, changes.flatMap(ch => [ch.from, ch.to])) : changes.flatMap(ch => [ch.from, ch.to]);
     const events: HostDocumentChange[] = changes.map((ch, i) => ({
       rangeOffset: offsets[2 * i], rangeLength: offsets[2 * i + 1] - offsets[2 * i],
@@ -328,7 +329,7 @@ for (const crlf of [false, true]) test("closed failed peers retain received work
 test("same-text reopening preserves collaboration history and adopts the new EOL mode", async () => {
   const f = fixture(), doc = f.document("note", "a\r\nb"), a = f.peer(doc);
   await a.initialize();
-  f.change(doc, [{ from: 4, to: 4, insert: "H" }]);
+  f.change(doc, [{ from: 3, to: 3, insert: "H" }]);
   const apply = f.host.apply; f.host.apply = async () => false;
   f.send(doc, a, { from: 3, insert: "X" }); await f.editQueue.drain("note"); f.close(doc, a); await settle();
   const current = f.document("note", "a\nbH", 20), b = f.peer(current, "b");
@@ -355,6 +356,35 @@ test("changed-text reopening preserves old recovery separately and resets curren
   assert.deepEqual(f.recoveries, ["note"]);
   f.coordinator.retry(current); await f.editQueue.drain("note");
   assert.equal(current.text, "different\ntext"); assert.deepEqual(f.writes, []);
+});
+
+for (const source of ["xyz", "longer source\ntext"]) test("source events before preview initialization preserve recovery with source length " + source.length, async () => {
+  const f = fixture(), doc = f.document(), a = f.peer(doc);
+  await a.initialize(); f.host.apply = async () => false;
+  f.send(doc, a, { from: 1, insert: "X" }); await f.editQueue.drain("note");
+  f.close(doc, a); await settle();
+  const reopened = f.document("note", source, 20);
+  f.change(reopened, [{ from: source.length, to: source.length, insert: "!" }]);
+  assert.deepEqual(f.coordinator.recoveryTexts("note"), ["aXbc"]);
+  const b = f.peer(reopened, "b"); await b.initialize();
+  assert.equal(b.state.doc.toString(), source + "!"); assert.equal(getSyncedVersion(b.state), 0);
+  assert.equal(f.coordinator.hasConflicts("note"), false);
+  assert.deepEqual(f.recoveries, ["note"]); assert.deepEqual(f.writes, []);
+});
+
+for (const crlf of [false, true]) test("same-text reopened source EOL conversion preserves pending positions from " + (crlf ? "CRLF" : "LF"), async () => {
+  const f = fixture(), doc = f.document("note", crlf ? "a\r\nb" : "a\nb"), a = f.peer(doc);
+  await a.initialize();
+  const apply = f.host.apply; f.host.apply = async () => false;
+  f.send(doc, a, { from: 1, insert: "X" }); await f.editQueue.drain("note"); f.close(doc, a); await settle();
+  const current = f.document("note", doc.text, 20);
+  f.change(current, [{ from: 0, to: 3, insert: "a\nb" }], !crlf);
+  const b = f.peer(current, "b"); await b.initialize();
+  assert.equal(getSyncedVersion(b.state), 0); assert.deepEqual(f.recoveries, []);
+  assert.deepEqual(f.coordinator.recoveryTexts("note"), [crlf ? "aX\nb" : "aX\r\nb"]);
+  f.host.apply = apply; f.coordinator.retry(current); await f.editQueue.drain("note");
+  assert.equal(b.state.doc.toString(), "aX\nb"); assert.equal(sendableUpdates(b.state).length, 0);
+  assert.equal(f.coordinator.hasConflicts("note"), false);
 });
 
 test("recovery retrieval deduplicates saved texts across document incarnations", async () => {
