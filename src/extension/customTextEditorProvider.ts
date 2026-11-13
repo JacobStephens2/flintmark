@@ -11,6 +11,7 @@ import { clampOffsetRange, cmToHostOffsets } from "../shared/ranges";
 import { DEFAULT_LINE_WIDTH, normalizeSettings } from "../shared/settings";
 import { resolveNewNoteName } from "./vault/newNote";
 import { attachmentName, dedupeName } from "./vault/attachment";
+import { exclusiveCreate } from "./vault/exclusiveCreate";
 import { SerialQueue } from "./serialQueue";
 import { LivePreviewSaveCoordinator } from "./livePreviewSaveCoordinator";
 import type {
@@ -588,7 +589,8 @@ export class OfmCustomTextEditorProvider
    * Create-on-click for an unresolved `[[wikilink]]`: confirm, write a stub
    * `<basename>.md` in the current note's folder, then open it. The filename is
    * derived by the pure `resolveNewNoteName` (basename only — no directories,
-   * no path traversal).
+   * no path traversal). The stub is an exclusive create, shared with attachment
+   * saves: a symlink at the destination name fails the create.
    */
   private async offerCreateNote(
     document: vscode.TextDocument,
@@ -621,7 +623,9 @@ export class OfmCustomTextEditorProvider
       const title = filename.replace(/\.md$/i, "");
       const content = new TextEncoder().encode(`# ${title}\n\n`);
       try {
-        await vscode.workspace.fs.writeFile(fileUri, content);
+        await exclusiveCreate(fileUri, content, (target, data) =>
+          vscode.workspace.fs.writeFile(target, data)
+        );
       } catch (e) {
         vscode.window.showErrorMessage(
           `Flintmark: couldn't create ${filename}: ${(e as Error).message}`
@@ -636,7 +640,8 @@ export class OfmCustomTextEditorProvider
   // -----------------------------------------------------------------------
   // Image paste/drop: write the bytes as an attachment next to the note, then
   // tell the webview the embed name to insert. Image MIME types only (the pure
-  // attachmentName refuses anything else), with a size cap.
+  // attachmentName refuses anything else), with a size cap. The bytes go
+  // through the same exclusive create as a new note.
   // -----------------------------------------------------------------------
 
   private static readonly MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024;
@@ -684,7 +689,9 @@ export class OfmCustomTextEditorProvider
     }
 
     try {
-      await vscode.workspace.fs.writeFile(target, bytes);
+      await exclusiveCreate(target, bytes, (uri, data) =>
+        vscode.workspace.fs.writeFile(uri, data)
+      );
     } catch (e) {
       vscode.window.showErrorMessage(
         `Flintmark: couldn't save attachment: ${(e as Error).message}`
