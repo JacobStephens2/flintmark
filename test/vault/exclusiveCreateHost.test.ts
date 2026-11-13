@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import * as vscode from "vscode";
 import { OfmCustomTextEditorProvider } from "../../src/extension/customTextEditorProvider";
 
@@ -127,7 +127,7 @@ async function main(): Promise<void> {
     mkdirSync(remoteDir);
     const remoteDest = join(remoteDir, "Linked.md");
     vscode.workspace.fs.stat = async (uri: { fsPath: string }) => {
-      if (uri.fsPath.endsWith("/Linked.md")) {
+      if (basename(uri.fsPath) === "Linked.md") {
         return { type: vscode.FileType.SymbolicLink, ctime: 0, mtime: 0, size: 0 };
       }
       throw new Error("missing");

@@ -1,5 +1,7 @@
 // Minimal vscode stand-in for the exclusive-create host regression.
 // Stat is replaced by the test; a successful stat is not proof the name is a file.
+import { dirname, join } from "node:path";
+
 export class Uri {
   scheme: string;
   path: string;
@@ -12,11 +14,14 @@ export class Uri {
   static file(p: string): Uri {
     return new Uri("file", p, p);
   }
+  // The real Uri.joinPath uses the platform separator. A slash-only join
+  // leaves `C:\notes\Current.md/Free note.md` on Windows, so the create
+  // misses the note folder.
   static joinPath(base: Uri, ...parts: string[]): Uri {
     let p = base.fsPath;
     for (const part of parts) {
-      if (part === "..") p = p.replace(/\/[^/]+$/, "") || "/";
-      else if (part !== ".") p = p.replace(/\/$/, "") + "/" + part;
+      if (part === "..") p = dirname(p);
+      else if (part !== ".") p = join(p, part);
     }
     return new Uri(base.scheme, p, p);
   }
