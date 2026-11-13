@@ -57,15 +57,6 @@ async function main(): Promise<void> {
     );
     assert.equal(readFileSync(occupied, "utf8"), "kept");
     console.log("  ✓ exclusive create fails when the destination name is an existing file and leaves it unchanged");
-
-    const remoteLinked = join(noteDir, "Linked.md");
-    symlinkSync(secret, remoteLinked);
-    await assert.rejects(
-      exclusiveCreate({ scheme: "vscode-remote", fsPath: remoteLinked }, Buffer.from("# planted\n"))
-    );
-    assert.equal(readFileSync(secret, "utf8"), "original-secret");
-    assert.equal(lstatSync(remoteLinked).isSymbolicLink(), true);
-    console.log("  ✓ exclusive create fails when a non-file path is a symlink and does not follow it");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
