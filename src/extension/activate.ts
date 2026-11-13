@@ -1,5 +1,4 @@
 import * as vscode from "vscode";
-import { DocumentSyncManager } from "./documentSync";
 import { OfmCustomTextEditorProvider } from "./customTextEditorProvider";
 import { registerCommands } from "./commands";
 import { registerOutline } from "./outline";
@@ -13,7 +12,6 @@ import { WorkspaceIndexDriver } from "./vault/workspaceIndexDriver";
 import { DocumentStructureService } from "./documentStructureService";
 
 export function activate(context: vscode.ExtensionContext): void {
-  const syncManager = new DocumentSyncManager();
   const workspaceIndexes = new WorkspaceIndexDriver();
   const documentStructures = new DocumentStructureService();
   context.subscriptions.push(documentStructures);
@@ -33,7 +31,6 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const provider = new OfmCustomTextEditorProvider(
     context,
-    syncManager,
     vault,
     imageIndex
   );
@@ -55,11 +52,6 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     )
   );
-
-  // Clean up suppression set on deactivate.
-  context.subscriptions.push({
-    dispose: () => syncManager.dispose(),
-  });
 
   console.log("[ofm] activated");
 }

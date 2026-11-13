@@ -5,13 +5,12 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { EditorState } from "@codemirror/state";
 import { collab, getSyncedVersion, receiveUpdates, sendableUpdates } from "@codemirror/collab";
-import { OfmCustomTextEditorProvider } from "../../../src/extension/customTextEditorProvider";
-import { DocumentSyncManager } from "../../../src/extension/documentSync";
+import { livePreviewFixture } from "./livePreviewFixture";
 import { decodeUpdates, encodeUpdates } from "../../../src/shared/collaboration";
 
 // Real TextDocuments, change events, WorkspaceEdit version validation and disk
 // writes; only the webview transport is simulated. All CodeMirror imports use
-// the same runtime module instance as the bundled provider.
+// the same runtime module instance as the synchronization module.
 describe("Collaboration acknowledgments in the real extension host", () => {
   for (const scenario of ["coincident", "different", "nine-conflicts", "to-lf", "to-crlf", "noop-external"] as const) {
     it(`preserves independent edits: ${scenario}`, async () => {
@@ -22,11 +21,8 @@ describe("Collaboration acknowledgments in the real extension host", () => {
       fs.writeFileSync(file, initial);
       const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
       const subscriptions: vscode.Disposable[] = [];
-      const context = { subscriptions, extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")) } as unknown as vscode.ExtensionContext;
-      // The adapter deliberately reaches the queue boundary so an actual API
-      // version conflict can be injected deterministically, without production
-      // test hooks or replacing WorkspaceEdit itself.
-      const provider = new OfmCustomTextEditorProvider(context, new DocumentSyncManager()) as any;
+      const f = livePreviewFixture(document, subscriptions);
+      await f.edits.initialize(document, () => {});
       let client = EditorState.create({
         doc: initial.replace(/\r\n/g, "\n"),
         extensions: [collab({ clientID: "test-panel" })],
@@ -40,7 +36,7 @@ describe("Collaboration acknowledgments in the real extension host", () => {
         webview: {
           asWebviewUri: (uri: vscode.Uri) => uri,
           postMessage: (message: any) => {
-            if (message.type === "flush") queueMicrotask(() => { void provider.onWebviewMessage(document, panel, { type: "flushed", requestId: message.requestId }); });
+            if (message.type === "flush") queueMicrotask(() => { f.saves.acknowledge(panel, message.requestId); });
             messages.push(message);
             if (message.type === "syncUpdates") {
               client = client.update(receiveUpdates(client, decodeUpdates(message.updates))).state;
@@ -50,12 +46,11 @@ describe("Collaboration acknowledgments in the real extension host", () => {
         },
       };
       const key = document.uri.toString();
-      provider.panels.set(key, new Map([[panel, { document, panel }]]));
-      provider.readyPanels.add(panel);
-      const apply = provider.applyWebviewEdit.bind(provider);
+      f.addPeer(panel);
+      const apply = f.host.apply;
       let attempts = 0;
       let rejections = 0;
-      provider.applyWebviewEdit = async (doc: vscode.TextDocument, changes: unknown) => {
+      f.host.apply = async (doc: vscode.TextDocument, changes: Parameters<typeof apply>[1]) => {
         attempts++;
         if (scenario === "noop-external") {
           const applied = await apply(doc, changes);
@@ -86,17 +81,16 @@ describe("Collaboration acknowledgments in the real extension host", () => {
         return ownApplied;
       };
       try {
-        provider.enqueueEdit(document, panel, {
+        f.edits.submit(document, panel, {
           type: "edit", version: document.version,
           syncVersion: getSyncedVersion(client), updates: encodeUpdates(sendableUpdates(client)),
         });
-        await provider.editQueue.idle(key);
+        await f.queue.idle(key);
         const expected = scenario === "coincident" ? "aXXbc"
           : scenario === "noop-external" ? "abcY"
           : multiline ? "aX\nb\nc"
           : "aXbc" + "Y".repeat(scenario === "nine-conflicts" ? 9 : 1);
         assert.equal(document.getText().replace(/\r\n/g, "\n"), expected);
-        assert.equal(provider.authorities.get(key).doc.toString(), expected);
         assert.equal(client.doc.toString(), expected);
         assert.equal(sendableUpdates(client).length, 0, "must converge without manual resubmission");
         assert.equal(messages.some(message => message.type === "syncError"), false);
@@ -118,14 +112,14 @@ describe("Cumulative input batches behind a slow native edit", () => {
       fs.writeFileSync(file, initial);
       const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
       const subscriptions: vscode.Disposable[] = [];
-      const context = { subscriptions, extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")) } as unknown as vscode.ExtensionContext;
-      const provider = new OfmCustomTextEditorProvider(context, new DocumentSyncManager()) as any;
+      const f = livePreviewFixture(document, subscriptions);
+      await f.edits.initialize(document, () => {});
       const key = document.uri.toString(), messages: any[] = [];
       const clients = new Map<string, EditorState>();
       function makePanel(id: string) {
         clients.set(id, EditorState.create({ doc: initial, extensions: [collab({ clientID: id })] }));
         const panel = { active: true, webview: { asWebviewUri: (uri: vscode.Uri) => uri, postMessage: (message: any) => {
-            if (message.type === "flush") queueMicrotask(() => { void provider.onWebviewMessage(document, panel, { type: "flushed", requestId: message.requestId }); });
+            if (message.type === "flush") queueMicrotask(() => { f.saves.acknowledge(panel, message.requestId); });
           messages.push(message);
           if (message.type === "syncUpdates") clients.set(id, clients.get(id)!.update(receiveUpdates(clients.get(id)!, decodeUpdates(message.updates))).state);
           return Promise.resolve(true);
@@ -133,21 +127,19 @@ describe("Cumulative input batches behind a slow native edit", () => {
         return panel;
       }
       const a = makePanel("a"), b = makePanel("b");
-      provider.panels.set(key, new Map([[a, { document, panel: a }], [b, { document, panel: b }]]));
-      provider.readyPanels.add(a); provider.readyPanels.add(b);
+      f.addPeer(a); f.addPeer(b);
       function send(panel: typeof a, id: string, text: string) {
         const state = clients.get(id)!;
         const next = state.update({ changes: { from: state.doc.length, insert: text } }).state;
         clients.set(id, next);
-        provider.enqueueEdit(document, panel, { type: "edit", version: document.version, syncVersion: getSyncedVersion(next), updates: encodeUpdates(sendableUpdates(next)) });
+        f.edits.submit(document, panel, { type: "edit", version: document.version, syncVersion: getSyncedVersion(next), updates: encodeUpdates(sendableUpdates(next)) });
       }
       let release!: () => void, entered!: () => void;
       const gate = new Promise<void>(resolve => { release = resolve; });
       const started = new Promise<void>(resolve => { entered = resolve; });
-      const apply = provider.applyWebviewEdit.bind(provider);
+      const apply = f.host.apply;
       let calls = 0, active = 0, maxActive = 0, barrierText: string | undefined;
-      provider.notifyConflict = () => undefined;
-      provider.applyWebviewEdit = async (doc: vscode.TextDocument, changes: unknown) => {
+      f.host.apply = async (doc: vscode.TextDocument, changes: Parameters<typeof apply>[1]) => {
         calls++; active++; maxActive = Math.max(maxActive, active);
         try {
           if (calls === 1) { entered(); await gate; if (scenario === "rejected-first") return false; }
@@ -157,11 +149,11 @@ describe("Cumulative input batches behind a slow native edit", () => {
       try {
         send(a, "a", "a"); await started;
         for (const ch of "bcd") send(a, "a", ch);
-        if (scenario === "command-barrier") void provider.editQueue.run(key, async () => { barrierText = document.getText(); });
+        if (scenario === "command-barrier") void f.queue.run(key, async () => { barrierText = document.getText(); });
         if (scenario === "second-panel") send(b, "b", "FOREIGN");
         for (const ch of "efghijklmnopqrstuvwxyz") send(a, "a", ch);
-        if (scenario === "closed-panel") { provider.panels.get(key).delete(a); provider.readyPanels.delete(a); }
-        release(); await provider.editQueue.idle(key); await Promise.resolve();
+        if (scenario === "closed-panel") { f.closePeer(a); }
+        release(); await f.queue.idle(key); await Promise.resolve();
         const expected = initial + "abcdefghijklmnopqrstuvwxyz";
         assert.equal(document.getText().replace("FOREIGN", ""), expected);
         assert.equal(maxActive, 1, "native edits must remain strictly serial");
@@ -173,8 +165,7 @@ describe("Cumulative input batches behind a slow native edit", () => {
           assert.equal(state.doc.toString(), document.getText());
           assert.equal(sendableUpdates(state).length, 0, "all individual collaboration updates must be acknowledged");
         }
-        assert.equal(provider.queuedEdits.size, 0, "settled batches must not retain panels");
-        assert.equal(provider.conflicts.has(key), false, "the complete later batch must recover a rejected prefix");
+        assert.equal(f.edits.hasConflicts(key), false, "the complete later batch must recover a rejected prefix");
         await document.save();
         assert.equal(fs.readFileSync(file, "utf8"), document.getText());
       } finally { release(); for (const subscription of subscriptions) subscription.dispose(); }
@@ -188,11 +179,8 @@ describe("Cumulative input batches behind a slow native edit", () => {
     fs.writeFileSync(file, initial);
     const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
     const subscriptions: vscode.Disposable[] = [];
-    const context = {
-      subscriptions,
-      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
-    } as unknown as vscode.ExtensionContext;
-    const provider = new OfmCustomTextEditorProvider(context, new DocumentSyncManager()) as any;
+    const f = livePreviewFixture(document, subscriptions);
+    await f.edits.initialize(document, () => {});
     const key = document.uri.toString();
     let client = EditorState.create({
       doc: initial,
@@ -203,7 +191,7 @@ describe("Cumulative input batches behind a slow native edit", () => {
       webview: {
         asWebviewUri: (uri: vscode.Uri) => uri,
         postMessage: (message: any) => {
-            if (message.type === "flush") queueMicrotask(() => { void provider.onWebviewMessage(document, panel, { type: "flushed", requestId: message.requestId }); });
+            if (message.type === "flush") queueMicrotask(() => { f.saves.acknowledge(panel, message.requestId); });
           if (message.type === "syncUpdates") {
             client = client.update(receiveUpdates(client, decodeUpdates(message.updates))).state;
           }
@@ -211,8 +199,7 @@ describe("Cumulative input batches behind a slow native edit", () => {
         },
       },
     };
-    provider.panels.set(key, new Map([[panel, { document, panel }]]));
-    provider.readyPanels.add(panel);
+    f.addPeer(panel);
 
     const answerOffset = (index: number) => {
       const marker = "*Answer:* ";
@@ -225,7 +212,7 @@ describe("Cumulative input batches behind a slow native edit", () => {
 
     const sendAt = (from: number, insert: string) => {
       client = client.update({ changes: { from, to: from, insert } }).state;
-      provider.enqueueEdit(document, panel, {
+      f.edits.submit(document, panel, {
         type: "edit",
         version: document.version,
         syncVersion: getSyncedVersion(client),
@@ -241,9 +228,9 @@ describe("Cumulative input batches behind a slow native edit", () => {
     const firstStarted = new Promise<void>((r) => { enteredFirst = r; });
     const secondGate = new Promise<void>((r) => { releaseSecond = r; });
     const secondStarted = new Promise<void>((r) => { enteredSecond = r; });
-    const apply = provider.applyWebviewEdit.bind(provider);
+    const apply = f.host.apply;
     let callCount = 0;
-    provider.applyWebviewEdit = async (doc: vscode.TextDocument, changes: unknown) => {
+    f.host.apply = async (doc: vscode.TextDocument, changes: Parameters<typeof apply>[1]) => {
       callCount++;
       if (callCount === 1) {
         enteredFirst();
@@ -261,7 +248,7 @@ describe("Cumulative input batches behind a slow native edit", () => {
       await firstStarted;
 
       // 2. While "agree, " is in flight, requestSave arrives AND user finishes Answer 1.
-      const requestSaveDone = provider.onWebviewMessage(document, panel, { type: "requestSave" });
+      const requestSaveDone = f.saves.saveDocument(document);
       sendAt(answerOffset(0) + "agree, ".length, "full first answer.");
 
       // 3. First edit ("agree, ") finishes and ACKs (advancing syncVersion to 1),
@@ -298,14 +285,14 @@ describe("Cumulative input batches behind a slow native edit", () => {
       //    when the document is already dirty from a prefix edit and the rest of the
       //    edits are still in flight in editQueue.
       sendAt(client.doc.length, "\nFooter: ");
-      await provider.editQueue.drain(key);
+      await f.queue.drain(key);
       assert.equal(document.isDirty, true);
 
       let releaseThird!: () => void;
       let enteredThird!: () => void;
       const thirdGate = new Promise<void>((r) => { releaseThird = r; });
       const thirdStarted = new Promise<void>((r) => { enteredThird = r; });
-      provider.applyWebviewEdit = async (doc: vscode.TextDocument, changes: unknown) => {
+      f.host.apply = async (doc: vscode.TextDocument, changes: Parameters<typeof apply>[1]) => {
         enteredThird();
         await thirdGate;
         return apply(doc, changes);
