@@ -10,7 +10,6 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { exclusiveCreate } from "../../src/extension/vault/exclusiveCreate";
@@ -61,24 +60,12 @@ async function main(): Promise<void> {
 
     const remoteLinked = join(noteDir, "Linked.md");
     symlinkSync(secret, remoteLinked);
-    // A following provider (workspace.fs.writeFile opens with flag "w") must not
-    // be consulted. The extra argument is ignored unless a later change starts
-    // using it to write.
-    const follow = async (uri: { fsPath: string }, bytes: Uint8Array) => {
-      await writeFile(uri.fsPath, bytes);
-    };
     await assert.rejects(
-      (
-        exclusiveCreate as (
-          uri: { scheme: string; fsPath: string },
-          bytes: Uint8Array,
-          providerWrite: typeof follow
-        ) => Promise<void>
-      )({ scheme: "vscode-remote", fsPath: remoteLinked }, Buffer.from("# planted\n"), follow)
+      exclusiveCreate({ scheme: "vscode-remote", fsPath: remoteLinked }, Buffer.from("# planted\n"))
     );
     assert.equal(readFileSync(secret, "utf8"), "original-secret");
     assert.equal(lstatSync(remoteLinked).isSymbolicLink(), true);
-    console.log("  ✓ exclusive create fails when a non-file destination name is a symlink and does not follow it");
+    console.log("  ✓ exclusive create fails when a non-file path is a symlink and does not follow it");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -122,6 +122,27 @@ async function main(): Promise<void> {
     assert.equal(lstatSync(deduped).isFile(), true);
     assert.equal(saved.posted?.embed, "taken-1.png");
     console.log("  ✓ an existing image name still saves a new regular file beside it");
+
+    const remoteDir = join(root, "remote-view");
+    mkdirSync(remoteDir);
+    const remoteDest = join(remoteDir, "Linked.md");
+    vscode.workspace.fs.stat = async (uri: { fsPath: string }) => {
+      if (uri.fsPath.endsWith("/Linked.md")) {
+        return { type: vscode.FileType.SymbolicLink, ctime: 0, mtime: 0, size: 0 };
+      }
+      throw new Error("missing");
+    };
+    vscode.window.errors.length = 0;
+    const remoteDoc = {
+      uri: new vscode.Uri("vscode-remote", join(remoteDir, "Current.md"), join(remoteDir, "Current.md")),
+    };
+    await provider.offerCreateNote(remoteDoc, "Linked");
+    assert.ok(
+      vscode.window.errors.some((m: string) => /couldn't create/i.test(m)),
+      JSON.stringify(vscode.window.errors)
+    );
+    assert.throws(() => lstatSync(remoteDest));
+    console.log("  ✓ a non-file symlink fails the note create and does not write the extension-host path");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

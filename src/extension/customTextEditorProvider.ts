@@ -70,8 +70,7 @@ type PanelRecord = {
   panel: vscode.WebviewPanel;
 };
 
-/** `vscode.FileType.SymbolicLink`, a bit flag on `FileStat.type`. */
-const FILE_TYPE_SYMBOLIC_LINK = 64;
+type DestinationKind = "symlink" | "present" | "absent";
 
 // ---------------------------------------------------------------------------
 // CustomTextEditorProvider
@@ -608,9 +607,9 @@ export class OfmCustomTextEditorProvider
     const dir = vscode.Uri.joinPath(document.uri, "..");
     const fileUri = vscode.Uri.joinPath(dir, filename);
 
-    // A real non-symlink file is opened. A missing name, or a symlink at that
-    // name, is an exclusive create — the create fails when the name is a symlink.
-    if (!(await this.isExistingNonSymlink(fileUri))) {
+    // A real non-symlink file is opened. A missing name is created. A symlink
+    // fails the create and is not opened.
+    if ((await this.destinationKind(fileUri)) !== "present") {
       const CREATE = "Create note";
       const choice = await vscode.window.showInformationMessage(
         `"${target}" doesn't exist yet. Create it?`,
@@ -620,7 +619,7 @@ export class OfmCustomTextEditorProvider
       const title = filename.replace(/\.md$/i, "");
       const content = new TextEncoder().encode(`# ${title}\n\n`);
       try {
-        await exclusiveCreate(fileUri, content);
+        await this.createInNoteFolder(fileUri, content);
       } catch (e) {
         vscode.window.showErrorMessage(
           `Flintmark: couldn't create ${filename}: ${(e as Error).message}`
@@ -670,15 +669,14 @@ export class OfmCustomTextEditorProvider
     const dir = vscode.Uri.joinPath(document.uri, "..");
     let finalName = name;
     let target = vscode.Uri.joinPath(dir, finalName);
-    for (let i = 1; i < 1000 && (await this.isExistingNonSymlink(target)); i++) {
+    for (let i = 1; i < 1000 && (await this.destinationKind(target)) === "present"; i++) {
       finalName = dedupeName(name, i);
       target = vscode.Uri.joinPath(dir, finalName);
     }
     // The loop can exit at the cap with the last candidate still taken — never
     // overwrite an existing attachment in that (pathological) case. A symlink
-    // is not "taken" in that sense: the exclusive create below fails instead
-    // of skipping the link and writing a different name through it.
-    if (await this.isExistingNonSymlink(target)) {
+    // is not taken: createInNoteFolder fails instead of skipping the link.
+    if ((await this.destinationKind(target)) === "present") {
       vscode.window.showErrorMessage(
         "Flintmark: too many attachments with that name — rename and retry."
       );
@@ -686,7 +684,7 @@ export class OfmCustomTextEditorProvider
     }
 
     try {
-      await exclusiveCreate(target, bytes);
+      await this.createInNoteFolder(target, bytes);
     } catch (e) {
       vscode.window.showErrorMessage(
         `Flintmark: couldn't save attachment: ${(e as Error).message}`
@@ -699,23 +697,38 @@ export class OfmCustomTextEditorProvider
     panel.webview.postMessage(reply);
   }
 
-  /** An existing directory entry that is not a symlink. A symlink returns
-   * false so the caller runs the exclusive create, which fails closed. */
-  private async isExistingNonSymlink(uri: vscode.Uri): Promise<boolean> {
+  /** Classify the destination name. File-scheme entries use `lstat`, so a
+   * symlink is the name itself. Other schemes use the file-system provider:
+   * their note folder is not the extension host's `fsPath`. */
+  private async destinationKind(uri: vscode.Uri): Promise<DestinationKind> {
     if (uri.scheme === "file") {
       try {
         const st = await lstat(uri.fsPath);
-        return !st.isSymbolicLink();
+        return st.isSymbolicLink() ? "symlink" : "present";
       } catch {
-        return false;
+        return "absent";
       }
     }
     try {
       const stat = await vscode.workspace.fs.stat(uri);
-      return (stat.type & FILE_TYPE_SYMBOLIC_LINK) === 0;
+      return (stat.type & vscode.FileType.SymbolicLink) !== 0 ? "symlink" : "present";
     } catch {
-      return false;
+      return "absent";
     }
+  }
+
+  /** Write a new file in the note folder. A symlink fails before any write.
+   * Local files use one exclusive create; other schemes use their provider so
+   * the bytes land in that note folder rather than on the extension host. */
+  private async createInNoteFolder(uri: vscode.Uri, bytes: Uint8Array): Promise<void> {
+    if ((await this.destinationKind(uri)) === "symlink") {
+      throw new Error("destination is a symlink");
+    }
+    if (uri.scheme === "file") {
+      await exclusiveCreate(uri, bytes);
+      return;
+    }
+    await vscode.workspace.fs.writeFile(uri, bytes);
   }
 
   // -----------------------------------------------------------------------
