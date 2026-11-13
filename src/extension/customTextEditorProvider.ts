@@ -1,4 +1,5 @@
 import { noteLinkTarget, noteLinkCandidates } from "./noteLinkTarget";
+import { lstat } from "node:fs/promises";
 import * as vscode from "vscode";
 import { LivePreviewEditCoordinator } from "./livePreviewEditCoordinator";
 import { LivePreviewEditHost, hostDocumentChanges } from "./livePreviewEditHost";
@@ -11,6 +12,7 @@ import { clampOffsetRange, cmToHostOffsets } from "../shared/ranges";
 import { DEFAULT_LINE_WIDTH, normalizeSettings } from "../shared/settings";
 import { resolveNewNoteName } from "./vault/newNote";
 import { attachmentName, dedupeName } from "./vault/attachment";
+import { exclusiveCreate } from "./vault/exclusiveCreate";
 import { SerialQueue } from "./serialQueue";
 import { LivePreviewSaveCoordinator } from "./livePreviewSaveCoordinator";
 import type {
@@ -67,6 +69,8 @@ type PanelRecord = {
   document: vscode.TextDocument;
   panel: vscode.WebviewPanel;
 };
+
+type DestinationKind = "symlink" | "present" | "absent";
 
 // ---------------------------------------------------------------------------
 // CustomTextEditorProvider
@@ -588,7 +592,8 @@ export class OfmCustomTextEditorProvider
    * Create-on-click for an unresolved `[[wikilink]]`: confirm, write a stub
    * `<basename>.md` in the current note's folder, then open it. The filename is
    * derived by the pure `resolveNewNoteName` (basename only — no directories,
-   * no path traversal).
+   * no path traversal). The stub is an exclusive create, shared with attachment
+   * saves: a symlink at the destination name fails the create.
    */
   private async offerCreateNote(
     document: vscode.TextDocument,
@@ -602,16 +607,9 @@ export class OfmCustomTextEditorProvider
     const dir = vscode.Uri.joinPath(document.uri, "..");
     const fileUri = vscode.Uri.joinPath(dir, filename);
 
-    // Already on disk (e.g. resolver miss / race) → just open it.
-    let exists = false;
-    try {
-      await vscode.workspace.fs.stat(fileUri);
-      exists = true;
-    } catch {
-      /* not found — we'll offer to create */
-    }
-
-    if (!exists) {
+    // A real non-symlink file is opened. A missing name is created. A symlink
+    // fails the create and is not opened.
+    if ((await this.destinationKind(fileUri)) !== "present") {
       const CREATE = "Create note";
       const choice = await vscode.window.showInformationMessage(
         `"${target}" doesn't exist yet. Create it?`,
@@ -621,7 +619,7 @@ export class OfmCustomTextEditorProvider
       const title = filename.replace(/\.md$/i, "");
       const content = new TextEncoder().encode(`# ${title}\n\n`);
       try {
-        await vscode.workspace.fs.writeFile(fileUri, content);
+        await this.createInNoteFolder(fileUri, content);
       } catch (e) {
         vscode.window.showErrorMessage(
           `Flintmark: couldn't create ${filename}: ${(e as Error).message}`
@@ -636,7 +634,8 @@ export class OfmCustomTextEditorProvider
   // -----------------------------------------------------------------------
   // Image paste/drop: write the bytes as an attachment next to the note, then
   // tell the webview the embed name to insert. Image MIME types only (the pure
-  // attachmentName refuses anything else), with a size cap.
+  // attachmentName refuses anything else), with a size cap. The bytes go
+  // through the same exclusive create as a new note.
   // -----------------------------------------------------------------------
 
   private static readonly MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024;
@@ -670,13 +669,14 @@ export class OfmCustomTextEditorProvider
     const dir = vscode.Uri.joinPath(document.uri, "..");
     let finalName = name;
     let target = vscode.Uri.joinPath(dir, finalName);
-    for (let i = 1; i < 1000 && (await this.uriExists(target)); i++) {
+    for (let i = 1; i < 1000 && (await this.destinationKind(target)) === "present"; i++) {
       finalName = dedupeName(name, i);
       target = vscode.Uri.joinPath(dir, finalName);
     }
     // The loop can exit at the cap with the last candidate still taken — never
-    // overwrite an existing attachment in that (pathological) case.
-    if (await this.uriExists(target)) {
+    // overwrite an existing attachment in that (pathological) case. A symlink
+    // is not taken: createInNoteFolder fails instead of skipping the link.
+    if ((await this.destinationKind(target)) === "present") {
       vscode.window.showErrorMessage(
         "Flintmark: too many attachments with that name — rename and retry."
       );
@@ -684,7 +684,7 @@ export class OfmCustomTextEditorProvider
     }
 
     try {
-      await vscode.workspace.fs.writeFile(target, bytes);
+      await this.createInNoteFolder(target, bytes);
     } catch (e) {
       vscode.window.showErrorMessage(
         `Flintmark: couldn't save attachment: ${(e as Error).message}`
@@ -697,13 +697,38 @@ export class OfmCustomTextEditorProvider
     panel.webview.postMessage(reply);
   }
 
-  private async uriExists(uri: vscode.Uri): Promise<boolean> {
-    try {
-      await vscode.workspace.fs.stat(uri);
-      return true;
-    } catch {
-      return false;
+  /** Classify the destination name. File-scheme entries use `lstat`, so a
+   * symlink is the name itself. Other schemes use the file-system provider:
+   * their note folder is not the extension host's `fsPath`. */
+  private async destinationKind(uri: vscode.Uri): Promise<DestinationKind> {
+    if (uri.scheme === "file") {
+      try {
+        const st = await lstat(uri.fsPath);
+        return st.isSymbolicLink() ? "symlink" : "present";
+      } catch {
+        return "absent";
+      }
     }
+    try {
+      const stat = await vscode.workspace.fs.stat(uri);
+      return (stat.type & vscode.FileType.SymbolicLink) !== 0 ? "symlink" : "present";
+    } catch {
+      return "absent";
+    }
+  }
+
+  /** Write a new file in the note folder. A symlink fails before any write.
+   * Local files use one exclusive create; other schemes use their provider so
+   * the bytes land in that note folder rather than on the extension host. */
+  private async createInNoteFolder(uri: vscode.Uri, bytes: Uint8Array): Promise<void> {
+    if ((await this.destinationKind(uri)) === "symlink") {
+      throw new Error("destination is a symlink");
+    }
+    if (uri.scheme === "file") {
+      await exclusiveCreate(uri, bytes);
+      return;
+    }
+    await vscode.workspace.fs.writeFile(uri, bytes);
   }
 
   // -----------------------------------------------------------------------

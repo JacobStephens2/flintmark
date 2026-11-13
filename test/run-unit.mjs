@@ -11,6 +11,17 @@ import { spawnSync } from "node:child_process";
 import { readdirSync, statSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
+function vscodeAliasFor(file) {
+  const resolved = resolve(file);
+  if (resolved === resolve("test/vault/workspaceIndexDriver.test.ts")) {
+    return { vscode: resolve("test/fixtures/workspaceIndexVscode.ts") };
+  }
+  if (resolved === resolve("test/vault/exclusiveCreateHost.test.ts")) {
+    return { vscode: resolve("test/fixtures/exclusiveCreateVscode.ts") };
+  }
+  return undefined;
+}
+
 function walk(dir, acc = []) {
   for (const entry of readdirSync(dir)) {
     const p = join(dir, entry);
@@ -63,9 +74,8 @@ for (const f of files) {
     platform: "node",
     format: "cjs",
     outfile,
-    // Opt in only this host-boundary test; other tests must not silently mock VS Code.
-    alias: resolve(f) === resolve("test/vault/workspaceIndexDriver.test.ts")
-      ? { vscode: resolve("test/fixtures/workspaceIndexVscode.ts") } : undefined,
+    // Opt in only these host-boundary tests; other tests must not silently mock VS Code.
+    alias: vscodeAliasFor(f),
     sourcemap: "inline",
     logLevel: "warning",
   });
