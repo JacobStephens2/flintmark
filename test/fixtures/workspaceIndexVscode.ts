@@ -36,6 +36,7 @@ export const FileType = { Unknown: 0, File: 1, Directory: 2 };
 const deleted = new EventEmitter<Uri>();
 const created = new EventEmitter<Uri>();
 const leafCreated = new Map<string, EventEmitter<Uri>>();
+const leafChanged = new Map<string, EventEmitter<Uri>>();
 const leafDeleted = new Map<string, EventEmitter<Uri>>();
 const renamed = new EventEmitter<{ files: { oldUri: Uri; newUri: Uri }[] }>();
 const noopEvent = () => new Disposable();
@@ -56,6 +57,7 @@ export function reset(root: Uri, image: Uri[], note: Uri[]) {
   deleted.dispose();
   created.dispose();
   leafCreated.clear();
+  leafChanged.clear();
   leafDeleted.clear();
   directories.clear();
   scanTokens.length = 0;
@@ -75,6 +77,9 @@ export function createDirectory(uri: Uri) { directories.add(uri.path); created.f
 export function createLeaf(kind: 'note' | 'image', uri: Uri) {
   files[kind].push(uri);
   for (const [glob, event] of leafCreated) if (glob.includes(kind === 'note' ? 'md' : 'png')) event.fire(uri);
+}
+export function changeLeaf(kind: 'note' | 'image', uri: Uri) {
+  for (const [glob, event] of leafChanged) if (glob.includes(kind === 'note' ? 'md' : 'png')) event.fire(uri);
 }
 export function deleteLeaf(kind: 'note' | 'image', uri: Uri) {
   files[kind] = files[kind].filter((file) => file.path !== uri.path);
@@ -104,12 +109,14 @@ export const workspace = {
   },
   createFileSystemWatcher(glob: string) {
     const create = new EventEmitter<Uri>();
+    const change = new EventEmitter<Uri>();
     const remove = new EventEmitter<Uri>();
     leafCreated.set(glob, create);
+    leafChanged.set(glob, change);
     leafDeleted.set(glob, remove);
     return {
       onDidCreate: glob === '**/*' ? created.event : create.event,
-      onDidChange: noopEvent,
+      onDidChange: change.event,
       onDidDelete: glob === '**/*' ? deleted.event : remove.event,
       dispose() {},
     };

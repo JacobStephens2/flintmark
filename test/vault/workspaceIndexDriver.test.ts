@@ -32,6 +32,8 @@ async function main() {
     host.reset(root, [uri('/work/assets/Logo.png'), uri('/work/assets/logo.png')], []);
     const driver = new WorkspaceIndexDriver();
     const service = new ImageIndexService(driver);
+    const events: WorkspaceIndexRefreshEvent[] = [];
+    driver.onDidRefresh((event) => events.push(event));
     let publications = 0;
     service.onDidChange(() => { publications++; });
     const resolved = () => service.resolveImage(uri('/work/notes/note.md'), 'Logo.png', true)?.path;
@@ -48,6 +50,24 @@ async function main() {
       while (publications < 3 && performance.now() < deleteDeadline) await sleep(10);
       assert.ok(publications >= 3, 'colliding image deletion is applied');
       assert.equal(resolved(), '/work/assets/Logo.png', 'deleting one candidate preserves the other');
+      const beforeContent = service.resolveImage(uri('/work/notes/note.md'), 'Logo.png', true)!;
+      const beforePublications = publications;
+      const beforeScans = host.calls.imageScan;
+      host.changeLeaf('image', uri('/work/assets/Logo.png'));
+      const contentDeadline = performance.now() + 2000;
+      while (publications === beforePublications && performance.now() < contentDeadline) await sleep(10);
+      assert.equal(publications, beforePublications + 1, 'content change publishes a refresh');
+      const contentEvent = events[events.length - 1];
+      assert.equal(contentEvent.kind, 'image');
+      assert.equal(contentEvent.mode, 'content', 'content refresh does not patch paths');
+      assert.deepEqual(contentEvent.changedUris.map((file) => file.path), ['/work/assets/Logo.png']);
+      const afterContent = service.resolveImage(uri('/work/notes/note.md'), 'Logo.png', true)!;
+      assert.equal(afterContent.path, beforeContent.path, 'content refresh preserves membership');
+      assert.equal(Number(new URLSearchParams(afterContent.query).get('ofmIndex')),
+        Number(new URLSearchParams(beforeContent.query).get('ofmIndex')) + 1, 'content refresh advances the URI version');
+      assert.equal(service.resolveImage(uri('/work/notes/note.md'), 'new.png', true)?.path, '/work/new.png');
+      assert.equal(service.resolveImage(uri('/work/notes/note.md'), 'assets/logo.png', true)?.path, '/work/assets/Logo.png');
+      assert.equal(host.calls.imageScan, beforeScans, 'content refresh needs no membership rescan');
       console.log('✓ image patches preserve colliding resolution candidates');
     } catch (error) {
       failures++;

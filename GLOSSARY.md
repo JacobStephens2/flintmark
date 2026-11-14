@@ -1,5 +1,15 @@
 # Glossary
 
+## Image snapshot
+
+An immutable, per-workspace-root image membership and resolution view. It retains
+original root-relative path spellings, derives normalized lookups internally,
+and creates a replacement view when paths change. Its status determines whether
+indexed resolution is available.
+
+The [Image snapshot module](src/extension/vault/imageResolver.ts) owns image
+membership, path patches, and resolution behind a host-independent interface.
+
 ## Live Preview edit synchronization
 
 The per-document protocol that orders received Live Preview input with host
