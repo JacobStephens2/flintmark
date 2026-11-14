@@ -14,7 +14,10 @@ import { join, resolve } from "node:path";
 function vscodeAliasFor(file) {
   const resolved = resolve(file);
   if (resolved === resolve("test/vault/workspaceIndexDriver.test.ts")) {
-    return { vscode: resolve("test/fixtures/workspaceIndexVscode.ts") };
+    return {
+      vscode: resolve("test/fixtures/workspaceIndexVscode.ts"),
+      "node:fs/promises": resolve("test/fixtures/workspaceIndexFs.ts"),
+    };
   }
   if (resolved === resolve("test/vault/exclusiveCreateHost.test.ts")) {
     return { vscode: resolve("test/fixtures/exclusiveCreateVscode.ts") };
