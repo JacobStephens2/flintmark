@@ -2,12 +2,9 @@
 // bulk of the "open an Obsidian vault → images resolve" correctness surface.
 import assert from "node:assert";
 import {
-  buildSnapshot,
-  makeEntry,
   parseEmbedInner,
-  resolveImageRef,
   IMAGE_EXTS,
-  type ImageSnapshot,
+  ImageSnapshot,
 } from "../../src/extension/vault/imageResolver";
 
 let failed = 0;
@@ -22,13 +19,85 @@ function test(name: string, fn: () => void): void {
 }
 
 // helpers
-const snap = (paths: string[]): ImageSnapshot => buildSnapshot(paths);
+const snap = (paths: string[]): ImageSnapshot => new ImageSnapshot(paths);
 /** Resolve an EMBED (`![[pathPart]]`) → matched relPath or null. */
 const embed = (s: ImageSnapshot, dir: string[], p: string): string | null =>
-  resolveImageRef(s, dir, p, true)?.relPath ?? null;
+  s.resolve(dir, p, true)?.relPath ?? null;
 /** Resolve a MARKDOWN src (`![](src)`) → matched relPath or null. */
 const md = (s: ImageSnapshot, dir: string[], p: string): string | null =>
-  resolveImageRef(s, dir, p, false)?.relPath ?? null;
+  s.resolve(dir, p, false)?.relPath ?? null;
+
+test("path patches retain case-colliding candidates and their precedence", () => {
+  const original = new ImageSnapshot(["assets/Logo.png", "assets/logo.png"]);
+  const patched = original.patch(["unrelated.png"], []);
+  for (const s of [original, patched]) {
+    assert.equal(s.resolve(["notes"], "Logo.png", true)?.relPath, "assets/Logo.png");
+    assert.equal(s.resolve(["notes"], "logo.png", true)?.relPath, "assets/logo.png");
+    assert.equal(s.resolve([], "assets/Logo.png", true)?.relPath, "assets/logo.png");
+  }
+  const deleted = patched.patch([], ["assets/logo.png"]);
+  assert.equal(deleted.resolve(["notes"], "logo.png", true)?.relPath, "assets/Logo.png");
+  assert.equal(patched.resolve(["notes"], "logo.png", true)?.relPath, "assets/logo.png");
+});
+
+test("percent-spelling collisions survive unrelated additions and exact-spelling deletion", () => {
+  for (const { paths, winner } of [
+    { paths: ["assets/my pic.png", "assets/my%20pic.png"], winner: "assets/my%20pic.png" },
+    { paths: ["assets/my%20pic.png", "assets/my pic.png"], winner: "assets/my pic.png" },
+  ]) {
+    const original = snap(paths);
+    const patched = original.patch(["other.png"], []);
+    for (const s of [original, patched]) {
+      assert.equal(embed(s, [], "assets/my%20pic.png"), winner, "full-path last-entry precedence");
+      assert.equal(embed(s, ["notes"], "my%20pic.png"), "assets/my pic.png", "exact decoded basename");
+    }
+    assert.equal(embed(patched.patch([], ["assets/my pic.png"]), [], "assets/my pic.png"), "assets/my%20pic.png");
+    assert.equal(embed(patched.patch([], ["assets/my%20pic.png"]), [], "assets/my pic.png"), "assets/my pic.png");
+    assert.equal(embed(original, [], "assets/my pic.png"), winner, "older snapshot stays unchanged");
+  }
+});
+
+test("repeated additions and missing deletions preserve precedence; additions win overlaps", () => {
+  const original = snap(["assets/logo.png", "assets/Logo.png"]);
+  const repeated = original.patch(["assets/logo.png", "assets/logo.png"], ["assets/LOGO.png", "missing.png"]);
+  assert.equal(embed(repeated, [], "assets/logo.png"), "assets/Logo.png");
+  const overlap = repeated.patch(["assets/logo.png", "assets/logo.png"], ["assets/logo.png", "assets/logo.png"]);
+  assert.equal(embed(overlap, [], "assets/Logo.png"), "assets/logo.png");
+  assert.equal(embed(overlap, ["notes"], "Logo.png"), "assets/Logo.png");
+  assert.equal(embed(repeated, [], "assets/logo.png"), "assets/Logo.png");
+  assert.equal(embed(original, [], "assets/logo.png"), "assets/Logo.png");
+  const removed = overlap.patch([], ["assets/logo.png", "assets/logo.png"]);
+  assert.equal(embed(removed, [], "assets/logo.png"), "assets/Logo.png");
+  assert.equal(embed(removed.patch([], ["assets/Logo.png"]), [], "logo.png"), null);
+});
+
+test("a rename replaces the path without changing older snapshots or resolved entries", () => {
+  const original = snap(["assets/before.png"]);
+  const entry = original.resolve(["assets"], "before.png", true);
+  const renamed = original.patch(["assets/after.png"], ["assets/before.png"]);
+  assert.equal(embed(renamed, ["assets"], "./before.png"), null);
+  assert.equal(embed(renamed, ["assets"], "./after.png"), "assets/after.png");
+  assert.equal(embed(original, ["assets"], "./before.png"), "assets/before.png");
+  assert.equal(embed(original, ["assets"], "./after.png"), null);
+  assert.deepEqual(entry, { relPath: "assets/before.png", segments: ["assets", "before.png"], basename: "before.png", ext: "png" });
+});
+
+test("resolved records and segments cannot corrupt later queries or patches", () => {
+  const s = snap(["assets/Logo.png", "assets/logo.png"]);
+  for (const ref of ["assets/Logo.png", "Logo.png", "logo.png"]) {
+    const entry = s.resolve(["notes"], ref, true)!;
+    const originalPath = entry.relPath;
+    assert.ok(Object.isFrozen(entry));
+    assert.ok(Object.isFrozen(entry.segments));
+    for (const field of ["relPath", "basename", "ext", "segments"]) {
+      assert.equal(Reflect.set(entry, field, "corrupted"), false);
+    }
+    assert.equal(Reflect.set(entry.segments, "0", "corrupted"), false);
+    assert.throws(() => Array.prototype.push.call(entry.segments, "corrupted"), TypeError);
+    assert.equal(embed(s, ["notes"], ref), originalPath);
+    assert.equal(embed(s.patch(["unrelated.png"], []), ["notes"], ref), originalPath);
+  }
+});
 
 // --- bare basename / vault-wide -------------------------------------------
 
@@ -67,8 +136,14 @@ test("a foldered reference does NOT fall back to a bare basename match", () => {
 // --- duplicate ranking -----------------------------------------------------
 
 test("duplicate basenames: the shorter path wins", () => {
-  const s = snap(["deep/folder/pic.png", "pic.png"]);
-  assert.equal(embed(s, [], "pic.png"), "pic.png");
+  const s = snap(["deep/folder/pic.png", "assets/pic.png"]);
+  assert.equal(embed(s, ["notes"], "pic.png"), "assets/pic.png");
+});
+
+test("equal-length duplicate paths rank lexicographically regardless of construction order", () => {
+  for (const paths of [["z/pic.png", "a/pic.png"], ["a/pic.png", "z/pic.png"]]) {
+    assert.equal(embed(snap(paths), ["notes"], "pic.png"), "a/pic.png");
+  }
 });
 
 test("duplicate basenames: exact-case basename beats a case-only match", () => {
@@ -87,6 +162,12 @@ test("embed with raw spaces resolves", () => {
 test("markdown percent-encoded spaces resolve (decoded for lookup)", () => {
   const s = snap(["attachments/my pic.png"]);
   assert.equal(md(s, ["notes"], "my%20pic.png"), "attachments/my pic.png");
+});
+
+test("malformed escapes fall back to the original spelling", () => {
+  const s = snap(["assets/bad%ZZ.png"]);
+  assert.equal(md(s, ["notes"], "bad%ZZ.png"), "assets/bad%ZZ.png");
+  assert.equal(embed(s, [], "assets/bad%ZZ.png"), "assets/bad%ZZ.png");
 });
 
 // --- extension rules -------------------------------------------------------
@@ -121,11 +202,9 @@ test("./ and ../ are relative-ONLY (no vault-wide fallback)", () => {
 // --- Windows-style stored paths -------------------------------------------
 
 test("entries with backslash separators normalize correctly", () => {
-  const e = makeEntry("a\\b\\pic.png");
-  assert.deepEqual(e.segments, ["a", "b", "pic.png"]);
-  assert.equal(e.basename, "pic.png");
   const s = snap(["a\\b\\pic.png"]);
   assert.equal(embed(s, [], "pic.png"), "a/b/pic.png");
+  assert.equal(embed(s, [], "a\\b\\pic.png"), "a/b/pic.png");
 });
 
 // --- embed inner parsing (#anchor / |size) --------------------------------
@@ -152,8 +231,31 @@ test("an absolute path is never vault-resolved (POSIX / Windows / UNC)", () => {
 
 test("a non-ready snapshot resolves nothing (caller uses legacy fallback)", () => {
   for (const status of ["notReady", "overCap", "disabled"] as const) {
-    const s = buildSnapshot(["attachments/pic.png"], status);
+    const s = new ImageSnapshot(["attachments/pic.png"], status);
+    assert.equal(s.status, status);
+    assert.equal(Reflect.set(s, "status", "ready"), false);
     assert.equal(embed(s, ["notes"], "pic.png"), null);
+    assert.equal(md(s, ["attachments"], "pic.png"), null);
+    const patched = s.patch(["attachments/other.png"], []);
+    assert.equal(patched.status, "ready");
+    assert.equal(embed(patched, ["notes"], "pic.png"), "attachments/pic.png");
+    assert.equal(embed(patched, ["notes"], "other.png"), "attachments/other.png");
+    assert.equal(s.status, status);
+    assert.equal(embed(s, ["notes"], "other.png"), null);
+  }
+});
+
+test("construction and empty patches default to ready and copy their input paths", () => {
+  const paths = ["assets/pic.png"];
+  const original = snap(paths);
+  paths[0] = "changed.png";
+  const patched = original.patch([], []);
+  assert.notEqual(patched, original);
+  for (const s of [original, patched]) {
+    assert.equal(s.status, "ready");
+    assert.equal(Reflect.set(s, "status", "disabled"), false);
+    assert.equal(embed(s, [], "pic.png"), "assets/pic.png");
+    assert.equal(embed(s, [], "changed.png"), null);
   }
 });
 

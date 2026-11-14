@@ -9,11 +9,7 @@
 // document-relative resolution (no regression for same-folder images).
 
 import * as vscode from "vscode";
-import {
-  buildSnapshot,
-  resolveImageRef,
-  ImageSnapshot,
-} from "./imageResolver";
+import { ImageSnapshot } from "./imageResolver";
 import {
   relFromRoot,
   WorkspaceIndexDriver,
@@ -45,18 +41,16 @@ export class ImageIndexService implements vscode.Disposable {
       // open webviews re-request image URIs if the host reports a replacement.
       watchContent: true,
       maxFiles: () => this.maxFiles(),
-      notReady: () => buildSnapshot([], "notReady"),
-      disabled: () => buildSnapshot([], "disabled"),
+      notReady: () => new ImageSnapshot([], "notReady"),
+      disabled: () => new ImageSnapshot([], "disabled"),
       build: async (root, files) =>
-        buildSnapshot(files.map((u) => relFromRoot(root, u))),
+        new ImageSnapshot(files.map((u) => relFromRoot(root, u))),
       patchSnapshot: async (root, snapshot, patch) => {
         if (patch.mode === "content") return snapshot;
-        // byRelKey collapses normalized collisions. Basename buckets retain
-        // every original candidate needed for exact-case and path ranking.
-        const paths = new Set([...snapshot.byBaseKey.values()].flat().map((entry) => entry.relPath));
-        for (const uri of patch.deletedUris) paths.delete(relFromRoot(root, uri));
-        for (const uri of patch.changedUris) paths.add(relFromRoot(root, uri));
-        return buildSnapshot([...paths]);
+        return snapshot.patch(
+          patch.changedUris.map((uri) => relFromRoot(root, uri)),
+          patch.deletedUris.map((uri) => relFromRoot(root, uri))
+        );
       },
     });
     this.refreshSub = this.driver.onDidRefresh((event) => {
@@ -91,7 +85,7 @@ export class ImageIndexService implements vscode.Disposable {
     if (!snap) return undefined;
     const docRel = relFromRoot(folder.uri, documentUri);
     const docDir = docRel.split("/").slice(0, -1).filter((s) => s.length > 0);
-    const entry = resolveImageRef(snap, docDir, rawPath, requireImageExt);
+    const entry = snap.resolve(docDir, rawPath, requireImageExt);
     if (!entry) return undefined;
     const uri = vscode.Uri.joinPath(folder.uri, ...entry.segments);
     const version = this.handle.version(folder.uri);
