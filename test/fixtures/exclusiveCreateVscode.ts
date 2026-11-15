@@ -69,6 +69,12 @@ export const workspace = {
     writeFile: async (): Promise<void> => {
       throw new Error("write");
     },
+    rename: async (): Promise<void> => {
+      throw new Error("rename");
+    },
+    delete: async (): Promise<void> => {
+      throw new Error("delete");
+    },
   },
   onDidChangeTextDocument: () => ({ dispose() {} }),
   onWillSaveTextDocument: () => ({ dispose() {} }),

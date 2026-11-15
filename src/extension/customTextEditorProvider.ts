@@ -1,4 +1,5 @@
 import { noteLinkTarget, noteLinkCandidates } from "./noteLinkTarget";
+import { randomBytes } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import * as vscode from "vscode";
 import { LivePreviewEditCoordinator } from "./livePreviewEditCoordinator";
@@ -592,8 +593,9 @@ export class OfmCustomTextEditorProvider
    * Create-on-click for an unresolved `[[wikilink]]`: confirm, write a stub
    * `<basename>.md` in the current note's folder, then open it. The filename is
    * derived by the pure `resolveNewNoteName` (basename only — no directories,
-   * no path traversal). The stub is an exclusive create, shared with attachment
-   * saves: a symlink at the destination name fails the create.
+   * no path traversal). The stub goes through createInNoteFolder, shared with
+   * attachment saves: a symlink at the destination name fails the create, and
+   * other schemes rename a temporary file onto the name without overwrite.
    */
   private async offerCreateNote(
     document: vscode.TextDocument,
@@ -728,7 +730,32 @@ export class OfmCustomTextEditorProvider
       await exclusiveCreate(uri, bytes);
       return;
     }
-    await vscode.workspace.fs.writeFile(uri, bytes);
+    await this.providerCreate(uri, bytes);
+  }
+
+  /** Provider-safe create for non-`file` schemes. The public file API has no
+   * create-only write, and a provider's write follows a symlink at the name.
+   * The bytes go to an unpredictable temporary name in the note folder, then
+   * a rename with overwrite off moves that name to `uri`. A name taken after
+   * the check, including a symlink, fails the rename; a rename replaces names,
+   * not the files a link points to. A failure deletes the temporary file. */
+  private async providerCreate(uri: vscode.Uri, bytes: Uint8Array): Promise<void> {
+    const temp = vscode.Uri.joinPath(
+      uri,
+      "..",
+      `.flintmark-${randomBytes(16).toString("hex")}.tmp`
+    );
+    try {
+      await vscode.workspace.fs.writeFile(temp, bytes);
+      await vscode.workspace.fs.rename(temp, uri, { overwrite: false });
+    } catch (error) {
+      try {
+        await vscode.workspace.fs.delete(temp, { useTrash: false });
+      } catch {
+        // The temporary name was never written, or is already gone.
+      }
+      throw error;
+    }
   }
 
   // -----------------------------------------------------------------------
