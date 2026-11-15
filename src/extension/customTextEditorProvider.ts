@@ -1,5 +1,4 @@
 import { noteLinkTarget, noteLinkCandidates } from "./noteLinkTarget";
-import { randomBytes } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import * as vscode from "vscode";
 import { LivePreviewEditCoordinator } from "./livePreviewEditCoordinator";
@@ -13,7 +12,11 @@ import { clampOffsetRange, cmToHostOffsets } from "../shared/ranges";
 import { DEFAULT_LINE_WIDTH, normalizeSettings } from "../shared/settings";
 import { resolveNewNoteName } from "./vault/newNote";
 import { attachmentName, dedupeName } from "./vault/attachment";
-import { exclusiveCreate } from "./vault/exclusiveCreate";
+import {
+  exclusiveCreate,
+  providerExclusiveCreate,
+  temporaryCreateName,
+} from "./vault/exclusiveCreate";
 import { SerialQueue } from "./serialQueue";
 import { LivePreviewSaveCoordinator } from "./livePreviewSaveCoordinator";
 import type {
@@ -637,7 +640,7 @@ export class OfmCustomTextEditorProvider
   // Image paste/drop: write the bytes as an attachment next to the note, then
   // tell the webview the embed name to insert. Image MIME types only (the pure
   // attachmentName refuses anything else), with a size cap. The bytes go
-  // through the same exclusive create as a new note.
+  // through createInNoteFolder, like a new note.
   // -----------------------------------------------------------------------
 
   private static readonly MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024;
@@ -721,7 +724,8 @@ export class OfmCustomTextEditorProvider
 
   /** Write a new file in the note folder. A symlink fails before any write.
    * Local files use one exclusive create; other schemes use their provider so
-   * the bytes land in that note folder rather than on the extension host. */
+   * the bytes land in that note folder rather than on the extension host,
+   * through a temporary file renamed onto the name without overwrite. */
   private async createInNoteFolder(uri: vscode.Uri, bytes: Uint8Array): Promise<void> {
     if ((await this.destinationKind(uri)) === "symlink") {
       throw new Error("destination is a symlink");
@@ -730,32 +734,8 @@ export class OfmCustomTextEditorProvider
       await exclusiveCreate(uri, bytes);
       return;
     }
-    await this.providerCreate(uri, bytes);
-  }
-
-  /** Provider-safe create for non-`file` schemes. The public file API has no
-   * create-only write, and a provider's write follows a symlink at the name.
-   * The bytes go to an unpredictable temporary name in the note folder, then
-   * a rename with overwrite off moves that name to `uri`. A name taken after
-   * the check, including a symlink, fails the rename; a rename replaces names,
-   * not the files a link points to. A failure deletes the temporary file. */
-  private async providerCreate(uri: vscode.Uri, bytes: Uint8Array): Promise<void> {
-    const temp = vscode.Uri.joinPath(
-      uri,
-      "..",
-      `.flintmark-${randomBytes(16).toString("hex")}.tmp`
-    );
-    try {
-      await vscode.workspace.fs.writeFile(temp, bytes);
-      await vscode.workspace.fs.rename(temp, uri, { overwrite: false });
-    } catch (error) {
-      try {
-        await vscode.workspace.fs.delete(temp, { useTrash: false });
-      } catch {
-        // The temporary name was never written, or is already gone.
-      }
-      throw error;
-    }
+    const temp = vscode.Uri.joinPath(uri, "..", temporaryCreateName());
+    await providerExclusiveCreate(vscode.workspace.fs, uri, temp, bytes);
   }
 
   // -----------------------------------------------------------------------

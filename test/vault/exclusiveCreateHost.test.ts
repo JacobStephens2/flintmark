@@ -1,5 +1,7 @@
 // Host regression: a symlink already visible to stat is not opened and is not
-// saved around. The create fails, and a free name is still a regular file.
+// saved around. The create fails, and a free name is still a regular file. On
+// non-file schemes, a symlink planted after the check is not written through:
+// the bytes go to a temporary file renamed onto the name without overwrite.
 import assert from "node:assert/strict";
 import {
   lstatSync,
@@ -186,7 +188,7 @@ async function main(): Promise<void> {
     const lateDoc = {
       uri: new vscode.Uri("vscode-remote", join(lateDir, "Current.md"), join(lateDir, "Current.md")),
     };
-    const leftovers = () => readdirSync(lateDir).filter((n) => n !== "Late.md" && !n.endsWith(".md"));
+    const tempLeftovers = () => readdirSync(lateDir).filter((n) => /^\.flintmark-.*\.tmp$/.test(n));
 
     vscode.window.errors.length = 0;
     vscode.commands.calls.length = 0;
@@ -198,7 +200,7 @@ async function main(): Promise<void> {
       JSON.stringify(vscode.window.errors)
     );
     assert.equal(vscode.commands.calls.length, 0);
-    assert.deepEqual(leftovers(), []);
+    assert.deepEqual(tempLeftovers(), []);
     assert.ok(writes.length > 0 && writes.every((w) => dirname(w) === lateDir && w !== lateLink));
     console.log("  ✓ a non-file note create does not write through a symlink planted after the check");
 
@@ -213,9 +215,34 @@ async function main(): Promise<void> {
     assert.equal(opened[0], "vscode.openWith");
     assert.equal(opened[1].scheme, "vscode-remote");
     assert.equal(opened[1].fsPath, remoteFree);
-    assert.deepEqual(leftovers(), []);
-    assert.notEqual(writes[0], writes[writes.length - 1]);
+    assert.deepEqual(tempLeftovers(), []);
+    // Each create picks a fresh temporary name, and none is the destination.
+    assert.equal(writes.length, 2);
+    assert.notEqual(writes[0], writes[1]);
+    assert.ok(!writes.includes(remoteFree));
     console.log("  ✓ a free non-file note name becomes a regular file and opens");
+
+    const lateShotSecret = join(outside, "late-shot.bin");
+    writeFileSync(lateShotSecret, "original-shot");
+    const lateShot = join(lateDir, "late.png");
+    symlinkSync(lateShotSecret, lateShot);
+    vscode.window.errors.length = 0;
+    const shotPanel: { webview: { postMessage(msg: unknown): void }; posted?: unknown } = {
+      webview: { postMessage(msg) { shotPanel.posted = msg; } },
+    };
+    await provider.handleSaveAttachment(lateDoc, shotPanel, {
+      type: "saveAttachment",
+      requestId: "r3",
+      filename: "late.png",
+      mime: "image/png",
+      dataBase64: Buffer.from("forged-image").toString("base64"),
+    });
+    assert.equal(readFileSync(lateShotSecret, "utf8"), "original-shot");
+    assert.equal(lstatSync(lateShot).isSymbolicLink(), true);
+    assert.equal(shotPanel.posted, undefined);
+    assert.ok(vscode.window.errors.some((m: string) => /couldn't save attachment/i.test(m)));
+    assert.deepEqual(tempLeftovers(), []);
+    console.log("  ✓ a non-file image save does not write through a symlink planted after the check");
 
     renameFault = new Error("provider unavailable");
     vscode.window.errors.length = 0;
@@ -227,7 +254,7 @@ async function main(): Promise<void> {
     );
     assert.equal(vscode.commands.calls.length, 0);
     assert.throws(() => lstatSync(join(lateDir, "Unlucky.md")));
-    assert.deepEqual(leftovers(), []);
+    assert.deepEqual(tempLeftovers(), []);
     console.log("  ✓ a failed non-file note create shows the error and leaves no temporary file");
   } finally {
     rmSync(root, { recursive: true, force: true });
