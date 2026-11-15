@@ -12,11 +12,7 @@ import { clampOffsetRange, cmToHostOffsets } from "../shared/ranges";
 import { DEFAULT_LINE_WIDTH, normalizeSettings } from "../shared/settings";
 import { resolveNewNoteName } from "./vault/newNote";
 import { attachmentName, dedupeName } from "./vault/attachment";
-import {
-  exclusiveCreate,
-  providerExclusiveCreate,
-  temporaryCreateName,
-} from "./vault/exclusiveCreate";
+import { exclusiveCreate, providerExclusiveCreate } from "./vault/exclusiveCreate";
 import { SerialQueue } from "./serialQueue";
 import { LivePreviewSaveCoordinator } from "./livePreviewSaveCoordinator";
 import type {
@@ -734,8 +730,9 @@ export class OfmCustomTextEditorProvider
       await exclusiveCreate(uri, bytes);
       return;
     }
-    const temp = vscode.Uri.joinPath(uri, "..", temporaryCreateName());
-    await providerExclusiveCreate(vscode.workspace.fs, uri, temp, bytes);
+    await providerExclusiveCreate(vscode.workspace.fs, uri, bytes, (dest, name) =>
+      vscode.Uri.joinPath(dest, "..", name)
+    );
   }
 
   // -----------------------------------------------------------------------

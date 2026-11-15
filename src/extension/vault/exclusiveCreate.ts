@@ -37,26 +37,21 @@ export interface ProviderCreateFs<U> {
   delete(uri: U, options: { useTrash: boolean }): PromiseLike<void>;
 }
 
-/** An unpredictable name for the temporary file of a provider create. It is
- * not a Markdown name, so the vault index does not pick it up. */
-export function temporaryCreateName(): string {
-  return `.flintmark-${randomBytes(16).toString("hex")}.tmp`;
-}
-
 /** Create `uri` through a file-system provider without overwriting it.
  *
  * The public file API has no create-only write, and a provider's write
- * follows a symlink at the name. The bytes go to `temp`, an unpredictable
- * name in the same folder (see `temporaryCreateName`), then a rename with
+ * follows a symlink at the name. The bytes go to an unpredictable temporary
+ * name in the same folder, `sibling(uri, name)`, then a rename with
  * overwrite off moves it to `uri`. A name taken after the caller's check,
  * including a symlink, fails the rename; a rename replaces names, not the
- * files a link points to. A failure deletes `temp` and rethrows. */
+ * files a link points to. A failure deletes the temporary file and rethrows. */
 export async function providerExclusiveCreate<U>(
   fs: ProviderCreateFs<U>,
   uri: U,
-  temp: U,
-  bytes: Uint8Array
+  bytes: Uint8Array,
+  sibling: (uri: U, name: string) => U
 ): Promise<void> {
+  const temp = sibling(uri, temporaryCreateName());
   try {
     await fs.writeFile(temp, bytes);
     await fs.rename(temp, uri, { overwrite: false });
@@ -68,6 +63,12 @@ export async function providerExclusiveCreate<U>(
     }
     throw error;
   }
+}
+
+/** An unpredictable name for the temporary file of a provider create. It is
+ * not a Markdown name, so the vault index does not pick it up. */
+function temporaryCreateName(): string {
+  return `.flintmark-${randomBytes(16).toString("hex")}.tmp`;
 }
 
 function isEnoent(error: unknown): boolean {

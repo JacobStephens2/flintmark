@@ -3,7 +3,8 @@
 // non-file schemes, a symlink planted after the check is not written through:
 // the bytes go to a temporary file renamed onto the name without overwrite.
 // Image saves share that path: a free name becomes a regular attachment, and a
-// failed save shows the error and leaves no temporary file.
+// failed save shows the error and leaves no temporary file. A failed write
+// shows its own error even when removing the temporary file fails too.
 import assert from "node:assert/strict";
 import {
   lstatSync,
@@ -194,6 +195,16 @@ async function main(): Promise<void> {
       uri: new vscode.Uri("vscode-remote", join(lateDir, "Current.md"), join(lateDir, "Current.md")),
     };
     const tempLeftovers = () => readdirSync(lateDir).filter((n) => /^\.flintmark-.*\.tmp$/.test(n));
+    /** Every write landed on a hidden, non-Markdown sibling of `dest` in the
+     * note folder, never on `dest` itself. */
+    const assertOnlyTempWritten = (dest: string) => {
+      assert.ok(writes.length > 0, "nothing was written");
+      for (const w of writes) {
+        assert.equal(dirname(w), lateDir);
+        assert.notEqual(w, dest);
+        assert.match(basename(w), /^\.flintmark-[0-9a-f]{32}\.tmp$/);
+      }
+    };
 
     vscode.window.errors.length = 0;
     vscode.commands.calls.length = 0;
@@ -206,7 +217,7 @@ async function main(): Promise<void> {
     );
     assert.equal(vscode.commands.calls.length, 0);
     assert.deepEqual(tempLeftovers(), []);
-    assert.ok(writes.length > 0 && writes.every((w) => dirname(w) === lateDir && w !== lateLink));
+    assertOnlyTempWritten(lateLink);
     console.log("  ✓ a non-file note create does not write through a symlink planted after the check");
 
     vscode.window.errors.length = 0;
@@ -249,10 +260,11 @@ async function main(): Promise<void> {
     assert.equal(readFileSync(freeShotPath, "utf8"), "free-image");
     assert.deepEqual(freeReply, { type: "attachmentSaved", requestId: "r4", embed: "free.png" });
     assert.equal(writes.length, 1);
-    assert.ok(dirname(writes[0]) === lateDir && writes[0] !== freeShotPath);
+    assertOnlyTempWritten(freeShotPath);
     assert.deepEqual(tempLeftovers(), []);
     console.log("  ✓ a free non-file image name becomes a regular attachment and the embed is inserted");
 
+    // The rename fails after the temporary file is written.
     renameFault = new Error("provider unavailable");
     vscode.window.errors.length = 0;
     vscode.commands.calls.length = 0;
@@ -267,8 +279,6 @@ async function main(): Promise<void> {
     console.log("  ✓ a failed non-file note create shows the error and leaves no temporary file");
 
     vscode.window.errors.length = 0;
-    // The rename fails after the temporary file is written.
-    renameFault = new Error("provider unavailable");
     writes.length = 0;
     const failedReply = await saveImage(lateDoc, "r5", "unlucky.png", "unlucky-image");
     assert.ok(
@@ -279,10 +289,31 @@ async function main(): Promise<void> {
     );
     assert.equal(failedReply, undefined);
     assert.equal(writes.length, 1);
-    assert.ok(dirname(writes[0]) === lateDir && writes[0] !== join(lateDir, "unlucky.png"));
+    assertOnlyTempWritten(join(lateDir, "unlucky.png"));
     assert.throws(() => lstatSync(join(lateDir, "unlucky.png")));
     assert.deepEqual(tempLeftovers(), []);
     console.log("  ✓ a failed non-file image save shows the error and leaves no temporary file");
+    renameFault = undefined;
+
+    // The write itself fails, and so does removing the temporary name: the
+    // user sees the write's error, not the cleanup's.
+    vscode.workspace.fs.writeFile = async () => {
+      throw new Error("disk full");
+    };
+    vscode.workspace.fs.delete = async () => {
+      throw new Error("cleanup failed");
+    };
+    vscode.window.errors.length = 0;
+    vscode.commands.calls.length = 0;
+    await provider.offerCreateNote(lateDoc, "Full");
+    assert.ok(
+      vscode.window.errors.some((m: string) => /couldn't create Full\.md: disk full/.test(m)),
+      JSON.stringify(vscode.window.errors)
+    );
+    assert.ok(!vscode.window.errors.some((m: string) => /cleanup failed/.test(m)));
+    assert.equal(vscode.commands.calls.length, 0);
+    assert.throws(() => lstatSync(join(lateDir, "Full.md")));
+    console.log("  ✓ a failed non-file write shows its own error even when cleanup fails");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
