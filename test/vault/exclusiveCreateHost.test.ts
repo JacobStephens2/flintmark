@@ -2,6 +2,8 @@
 // saved around. The create fails, and a free name is still a regular file. On
 // non-file schemes, a symlink planted after the check is not written through:
 // the bytes go to a temporary file renamed onto the name without overwrite.
+// Image saves share that path: a free name becomes a regular attachment, and a
+// failed save shows the error and leaves no temporary file.
 import assert from "node:assert/strict";
 import {
   lstatSync,
@@ -23,7 +25,7 @@ type NoteHost = {
   offerCreateNote(document: { uri: vscode.Uri }, target: string): Promise<void>;
   handleSaveAttachment(
     document: { uri: vscode.Uri },
-    panel: { webview: { postMessage(msg: unknown): void }; posted?: unknown },
+    panel: { webview: { postMessage(msg: unknown): void } },
     msg: {
       type: "saveAttachment";
       requestId: string;
@@ -60,6 +62,28 @@ async function main(): Promise<void> {
   const provider = Object.create(OfmCustomTextEditorProvider.prototype) as NoteHost;
   const doc = { uri: vscode.Uri.file(join(noteDir, "Current.md")) };
 
+  /** Paste `text` as a PNG named `filename` beside `document`, and return the
+   * reply the webview was sent, if any. */
+  const saveImage = async (
+    document: { uri: vscode.Uri },
+    requestId: string,
+    filename: string,
+    text: string
+  ): Promise<{ type?: string; requestId?: string; embed?: string } | undefined> => {
+    const reply: { posted?: { type?: string; requestId?: string; embed?: string } } = {};
+    const panel = {
+      webview: { postMessage(msg: unknown) { reply.posted = msg as typeof reply.posted; } },
+    };
+    await provider.handleSaveAttachment(document, panel, {
+      type: "saveAttachment",
+      requestId,
+      filename,
+      mime: "image/png",
+      dataBase64: Buffer.from(text).toString("base64"),
+    });
+    return reply.posted;
+  };
+
   try {
     vscode.window.errors.length = 0;
     vscode.commands.calls.length = 0;
@@ -84,19 +108,10 @@ async function main(): Promise<void> {
     console.log("  ✓ creating a note fails when the destination name is a dangling symlink");
 
     vscode.window.errors.length = 0;
-    const panel: { webview: { postMessage(msg: unknown): void }; posted?: unknown } = {
-      webview: { postMessage(msg) { panel.posted = msg; } },
-    };
-    await provider.handleSaveAttachment(doc, panel, {
-      type: "saveAttachment",
-      requestId: "r1",
-      filename: "shot.png",
-      mime: "image/png",
-      dataBase64: Buffer.from("forged-image").toString("base64"),
-    });
+    const posted = await saveImage(doc, "r1", "shot.png", "forged-image");
     assert.equal(readFileSync(photoSecret, "utf8"), "original-photo");
     assert.equal(lstatSync(photo).isSymbolicLink(), true);
-    assert.equal(panel.posted, undefined);
+    assert.equal(posted, undefined);
     assert.ok(vscode.window.errors.some((m: string) => /couldn't save attachment/i.test(m)));
     console.log("  ✓ saving an image fails when the destination name is a symlink");
 
@@ -110,21 +125,11 @@ async function main(): Promise<void> {
 
     const taken = join(noteDir, "taken.png");
     writeFileSync(taken, "taken-bytes");
-    const saved: { posted?: { embed?: string } } = {};
-    const takenPanel = {
-      webview: { postMessage(msg: unknown) { saved.posted = msg as { embed?: string }; } },
-    };
-    await provider.handleSaveAttachment(doc, takenPanel, {
-      type: "saveAttachment",
-      requestId: "r2",
-      filename: "taken.png",
-      mime: "image/png",
-      dataBase64: Buffer.from("new-image").toString("base64"),
-    });
+    const takenReply = await saveImage(doc, "r2", "taken.png", "new-image");
     assert.equal(readFileSync(taken, "utf8"), "taken-bytes");
     const deduped = join(noteDir, "taken-1.png");
     assert.equal(lstatSync(deduped).isFile(), true);
-    assert.equal(saved.posted?.embed, "taken-1.png");
+    assert.equal(takenReply?.embed, "taken-1.png");
     console.log("  ✓ an existing image name still saves a new regular file beside it");
 
     const remoteDir = join(root, "remote-view");
@@ -227,22 +232,26 @@ async function main(): Promise<void> {
     const lateShot = join(lateDir, "late.png");
     symlinkSync(lateShotSecret, lateShot);
     vscode.window.errors.length = 0;
-    const shotPanel: { webview: { postMessage(msg: unknown): void }; posted?: unknown } = {
-      webview: { postMessage(msg) { shotPanel.posted = msg; } },
-    };
-    await provider.handleSaveAttachment(lateDoc, shotPanel, {
-      type: "saveAttachment",
-      requestId: "r3",
-      filename: "late.png",
-      mime: "image/png",
-      dataBase64: Buffer.from("forged-image").toString("base64"),
-    });
+    const lateReply = await saveImage(lateDoc, "r3", "late.png", "forged-image");
     assert.equal(readFileSync(lateShotSecret, "utf8"), "original-shot");
     assert.equal(lstatSync(lateShot).isSymbolicLink(), true);
-    assert.equal(shotPanel.posted, undefined);
+    assert.equal(lateReply, undefined);
     assert.ok(vscode.window.errors.some((m: string) => /couldn't save attachment/i.test(m)));
     assert.deepEqual(tempLeftovers(), []);
     console.log("  ✓ a non-file image save does not write through a symlink planted after the check");
+
+    writes.length = 0;
+    vscode.window.errors.length = 0;
+    const freeReply = await saveImage(lateDoc, "r4", "free.png", "free-image");
+    const freeShotPath = join(lateDir, "free.png");
+    assert.deepEqual(vscode.window.errors, []);
+    assert.equal(lstatSync(freeShotPath).isFile(), true);
+    assert.equal(readFileSync(freeShotPath, "utf8"), "free-image");
+    assert.deepEqual(freeReply, { type: "attachmentSaved", requestId: "r4", embed: "free.png" });
+    assert.equal(writes.length, 1);
+    assert.ok(dirname(writes[0]) === lateDir && writes[0] !== freeShotPath);
+    assert.deepEqual(tempLeftovers(), []);
+    console.log("  ✓ a free non-file image name becomes a regular attachment and the embed is inserted");
 
     renameFault = new Error("provider unavailable");
     vscode.window.errors.length = 0;
@@ -256,6 +265,24 @@ async function main(): Promise<void> {
     assert.throws(() => lstatSync(join(lateDir, "Unlucky.md")));
     assert.deepEqual(tempLeftovers(), []);
     console.log("  ✓ a failed non-file note create shows the error and leaves no temporary file");
+
+    vscode.window.errors.length = 0;
+    // The rename fails after the temporary file is written.
+    renameFault = new Error("provider unavailable");
+    writes.length = 0;
+    const failedReply = await saveImage(lateDoc, "r5", "unlucky.png", "unlucky-image");
+    assert.ok(
+      vscode.window.errors.some((m: string) =>
+        /couldn't save attachment: provider unavailable/.test(m)
+      ),
+      JSON.stringify(vscode.window.errors)
+    );
+    assert.equal(failedReply, undefined);
+    assert.equal(writes.length, 1);
+    assert.ok(dirname(writes[0]) === lateDir && writes[0] !== join(lateDir, "unlucky.png"));
+    assert.throws(() => lstatSync(join(lateDir, "unlucky.png")));
+    assert.deepEqual(tempLeftovers(), []);
+    console.log("  ✓ a failed non-file image save shows the error and leaves no temporary file");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
