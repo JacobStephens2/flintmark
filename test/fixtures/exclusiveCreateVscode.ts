@@ -1,5 +1,6 @@
 // Minimal vscode stand-in for the exclusive-create host regression.
-// Stat is replaced by the test; a successful stat is not proof the name is a file.
+// The fs methods are replaced by the test; a successful stat is not proof the
+// name is a file.
 import { dirname, join } from "node:path";
 
 export class Uri {
@@ -68,6 +69,12 @@ export const workspace = {
     },
     writeFile: async (): Promise<void> => {
       throw new Error("write");
+    },
+    rename: async (): Promise<void> => {
+      throw new Error("rename");
+    },
+    delete: async (): Promise<void> => {
+      throw new Error("delete");
     },
   },
   onDidChangeTextDocument: () => ({ dispose() {} }),

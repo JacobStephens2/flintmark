@@ -1,5 +1,6 @@
 // Regression: creating an attachment or a new note must fail when the
 // destination name is a symlink, and must not write the link's target.
+// Provider creates are covered through the host in exclusiveCreateHost.test.ts.
 import assert from "node:assert/strict";
 import {
   lstatSync,
