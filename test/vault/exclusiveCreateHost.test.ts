@@ -1,17 +1,21 @@
 // Host regression: a symlink already visible to stat is not opened and is not
-// saved around. The create fails, and a free name is still a regular file.
+// saved around. The create fails, and a free name is still a regular file. On
+// non-file schemes, a symlink planted after the check is not written through:
+// the bytes go to a temporary file renamed onto the name without overwrite.
 import assert from "node:assert/strict";
 import {
   lstatSync,
   mkdtempSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import * as vscode from "vscode";
 import { OfmCustomTextEditorProvider } from "../../src/extension/customTextEditorProvider";
 
@@ -143,6 +147,115 @@ async function main(): Promise<void> {
     );
     assert.throws(() => lstatSync(remoteDest));
     console.log("  ✓ a non-file symlink fails the note create and does not write the extension-host path");
+
+    // A provider over the real disk: writeFile follows a symlink, as the
+    // disk provider does, and rename refuses an occupied name unless told to
+    // overwrite. Stat always misses, so a symlink planted after the check is
+    // what the create meets.
+    const lateDir = join(root, "late-view");
+    mkdirSync(lateDir);
+    const lateSecret = join(outside, "late-secret.txt");
+    writeFileSync(lateSecret, "original-late");
+    const lateLink = join(lateDir, "Late.md");
+    symlinkSync(lateSecret, lateLink);
+    const writes: string[] = [];
+    let renameFault: Error | undefined;
+    vscode.workspace.fs.stat = async () => {
+      throw new Error("missing");
+    };
+    vscode.workspace.fs.writeFile = async (uri: { fsPath: string }, bytes: Uint8Array) => {
+      writes.push(uri.fsPath);
+      writeFileSync(uri.fsPath, bytes);
+    };
+    vscode.workspace.fs.rename = async (
+      from: { fsPath: string },
+      to: { fsPath: string },
+      options?: { overwrite?: boolean }
+    ) => {
+      if (renameFault) throw renameFault;
+      let occupied = true;
+      try {
+        lstatSync(to.fsPath);
+      } catch {
+        occupied = false;
+      }
+      if (occupied && !options?.overwrite) throw new Error("EntryExists");
+      renameSync(from.fsPath, to.fsPath);
+    };
+    vscode.workspace.fs.delete = async (uri: { fsPath: string }) => {
+      rmSync(uri.fsPath, { force: true });
+    };
+    const lateDoc = {
+      uri: new vscode.Uri("vscode-remote", join(lateDir, "Current.md"), join(lateDir, "Current.md")),
+    };
+    const tempLeftovers = () => readdirSync(lateDir).filter((n) => /^\.flintmark-.*\.tmp$/.test(n));
+
+    vscode.window.errors.length = 0;
+    vscode.commands.calls.length = 0;
+    await provider.offerCreateNote(lateDoc, "Late");
+    assert.equal(readFileSync(lateSecret, "utf8"), "original-late");
+    assert.equal(lstatSync(lateLink).isSymbolicLink(), true);
+    assert.ok(
+      vscode.window.errors.some((m: string) => /couldn't create Late\.md/i.test(m)),
+      JSON.stringify(vscode.window.errors)
+    );
+    assert.equal(vscode.commands.calls.length, 0);
+    assert.deepEqual(tempLeftovers(), []);
+    assert.ok(writes.length > 0 && writes.every((w) => dirname(w) === lateDir && w !== lateLink));
+    console.log("  ✓ a non-file note create does not write through a symlink planted after the check");
+
+    vscode.window.errors.length = 0;
+    vscode.commands.calls.length = 0;
+    await provider.offerCreateNote(lateDoc, "Remote free");
+    const remoteFree = join(lateDir, "Remote free.md");
+    assert.equal(lstatSync(remoteFree).isFile(), true);
+    assert.equal(readFileSync(remoteFree, "utf8"), "# Remote free\n\n");
+    assert.deepEqual(vscode.window.errors, []);
+    const opened = vscode.commands.calls[0] as [string, { scheme: string; fsPath: string }, string];
+    assert.equal(opened[0], "vscode.openWith");
+    assert.equal(opened[1].scheme, "vscode-remote");
+    assert.equal(opened[1].fsPath, remoteFree);
+    assert.deepEqual(tempLeftovers(), []);
+    // Each create picks a fresh temporary name, and none is the destination.
+    assert.equal(writes.length, 2);
+    assert.notEqual(writes[0], writes[1]);
+    assert.ok(!writes.includes(remoteFree));
+    console.log("  ✓ a free non-file note name becomes a regular file and opens");
+
+    const lateShotSecret = join(outside, "late-shot.bin");
+    writeFileSync(lateShotSecret, "original-shot");
+    const lateShot = join(lateDir, "late.png");
+    symlinkSync(lateShotSecret, lateShot);
+    vscode.window.errors.length = 0;
+    const shotPanel: { webview: { postMessage(msg: unknown): void }; posted?: unknown } = {
+      webview: { postMessage(msg) { shotPanel.posted = msg; } },
+    };
+    await provider.handleSaveAttachment(lateDoc, shotPanel, {
+      type: "saveAttachment",
+      requestId: "r3",
+      filename: "late.png",
+      mime: "image/png",
+      dataBase64: Buffer.from("forged-image").toString("base64"),
+    });
+    assert.equal(readFileSync(lateShotSecret, "utf8"), "original-shot");
+    assert.equal(lstatSync(lateShot).isSymbolicLink(), true);
+    assert.equal(shotPanel.posted, undefined);
+    assert.ok(vscode.window.errors.some((m: string) => /couldn't save attachment/i.test(m)));
+    assert.deepEqual(tempLeftovers(), []);
+    console.log("  ✓ a non-file image save does not write through a symlink planted after the check");
+
+    renameFault = new Error("provider unavailable");
+    vscode.window.errors.length = 0;
+    vscode.commands.calls.length = 0;
+    await provider.offerCreateNote(lateDoc, "Unlucky");
+    assert.ok(
+      vscode.window.errors.some((m: string) => /couldn't create Unlucky\.md: provider unavailable/.test(m)),
+      JSON.stringify(vscode.window.errors)
+    );
+    assert.equal(vscode.commands.calls.length, 0);
+    assert.throws(() => lstatSync(join(lateDir, "Unlucky.md")));
+    assert.deepEqual(tempLeftovers(), []);
+    console.log("  ✓ a failed non-file note create shows the error and leaves no temporary file");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

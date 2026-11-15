@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { lstat, open } from "node:fs/promises";
 
 /** Create a new regular file at `uri` and write `bytes` into it.
@@ -27,6 +28,46 @@ export async function exclusiveCreate(
     }
   }
   throw alreadyExists(uri.fsPath);
+}
+
+/** The parts of `vscode.workspace.fs` a provider create uses. */
+export interface ProviderCreateFs<U> {
+  writeFile(uri: U, bytes: Uint8Array): PromiseLike<void>;
+  rename(source: U, target: U, options: { overwrite: boolean }): PromiseLike<void>;
+  delete(uri: U, options: { useTrash: boolean }): PromiseLike<void>;
+}
+
+/** An unpredictable name for the temporary file of a provider create. It is
+ * not a Markdown name, so the vault index does not pick it up. */
+export function temporaryCreateName(): string {
+  return `.flintmark-${randomBytes(16).toString("hex")}.tmp`;
+}
+
+/** Create `uri` through a file-system provider without overwriting it.
+ *
+ * The public file API has no create-only write, and a provider's write
+ * follows a symlink at the name. The bytes go to `temp`, an unpredictable
+ * name in the same folder (see `temporaryCreateName`), then a rename with
+ * overwrite off moves it to `uri`. A name taken after the caller's check,
+ * including a symlink, fails the rename; a rename replaces names, not the
+ * files a link points to. A failure deletes `temp` and rethrows. */
+export async function providerExclusiveCreate<U>(
+  fs: ProviderCreateFs<U>,
+  uri: U,
+  temp: U,
+  bytes: Uint8Array
+): Promise<void> {
+  try {
+    await fs.writeFile(temp, bytes);
+    await fs.rename(temp, uri, { overwrite: false });
+  } catch (error) {
+    try {
+      await fs.delete(temp, { useTrash: false });
+    } catch {
+      // The temporary name was never written, or is already gone.
+    }
+    throw error;
+  }
 }
 
 function isEnoent(error: unknown): boolean {

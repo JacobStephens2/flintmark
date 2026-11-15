@@ -12,7 +12,11 @@ import { clampOffsetRange, cmToHostOffsets } from "../shared/ranges";
 import { DEFAULT_LINE_WIDTH, normalizeSettings } from "../shared/settings";
 import { resolveNewNoteName } from "./vault/newNote";
 import { attachmentName, dedupeName } from "./vault/attachment";
-import { exclusiveCreate } from "./vault/exclusiveCreate";
+import {
+  exclusiveCreate,
+  providerExclusiveCreate,
+  temporaryCreateName,
+} from "./vault/exclusiveCreate";
 import { SerialQueue } from "./serialQueue";
 import { LivePreviewSaveCoordinator } from "./livePreviewSaveCoordinator";
 import type {
@@ -592,8 +596,9 @@ export class OfmCustomTextEditorProvider
    * Create-on-click for an unresolved `[[wikilink]]`: confirm, write a stub
    * `<basename>.md` in the current note's folder, then open it. The filename is
    * derived by the pure `resolveNewNoteName` (basename only — no directories,
-   * no path traversal). The stub is an exclusive create, shared with attachment
-   * saves: a symlink at the destination name fails the create.
+   * no path traversal). The stub goes through createInNoteFolder, shared with
+   * attachment saves: a symlink at the destination name fails the create, and
+   * other schemes rename a temporary file onto the name without overwrite.
    */
   private async offerCreateNote(
     document: vscode.TextDocument,
@@ -635,7 +640,7 @@ export class OfmCustomTextEditorProvider
   // Image paste/drop: write the bytes as an attachment next to the note, then
   // tell the webview the embed name to insert. Image MIME types only (the pure
   // attachmentName refuses anything else), with a size cap. The bytes go
-  // through the same exclusive create as a new note.
+  // through createInNoteFolder, like a new note.
   // -----------------------------------------------------------------------
 
   private static readonly MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024;
@@ -719,7 +724,8 @@ export class OfmCustomTextEditorProvider
 
   /** Write a new file in the note folder. A symlink fails before any write.
    * Local files use one exclusive create; other schemes use their provider so
-   * the bytes land in that note folder rather than on the extension host. */
+   * the bytes land in that note folder rather than on the extension host,
+   * through a temporary file renamed onto the name without overwrite. */
   private async createInNoteFolder(uri: vscode.Uri, bytes: Uint8Array): Promise<void> {
     if ((await this.destinationKind(uri)) === "symlink") {
       throw new Error("destination is a symlink");
@@ -728,7 +734,8 @@ export class OfmCustomTextEditorProvider
       await exclusiveCreate(uri, bytes);
       return;
     }
-    await vscode.workspace.fs.writeFile(uri, bytes);
+    const temp = vscode.Uri.joinPath(uri, "..", temporaryCreateName());
+    await providerExclusiveCreate(vscode.workspace.fs, uri, temp, bytes);
   }
 
   // -----------------------------------------------------------------------
