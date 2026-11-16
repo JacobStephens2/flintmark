@@ -20,7 +20,8 @@ async function main(): Promise<void> {
   // Same disk-backed provider behavior as the old host test: writes follow
   // links, and rename refuses occupied names when overwrite is false. Provider
   // paths deliberately differ from extension-host paths.
-  const remoteDocument = new vscode.Uri("vscode-remote", "/notes/Current.md");
+  const providerFolder = join(root, "provider-uri");
+  const remoteDocument = new vscode.Uri("vscode-remote", join(providerFolder, "Current.md"));
   let hideEntries = false;
   let renameFault: Error | undefined;
   let writeFault: Error | undefined;
@@ -28,7 +29,7 @@ async function main(): Promise<void> {
   const writes: string[] = [];
   const diskPath = (uri: vscode.Uri) => {
     assert.equal(uri.scheme, "vscode-remote");
-    assert.equal(dirname(uri.path), "/notes");
+    assert.equal(dirname(uri.path), providerFolder);
     return join(disk, basename(uri.path));
   };
   vscode.workspace.fs.stat = async uri => {
