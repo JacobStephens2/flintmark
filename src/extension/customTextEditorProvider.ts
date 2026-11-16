@@ -1,5 +1,4 @@
 import { noteLinkTarget, noteLinkCandidates } from "./noteLinkTarget";
-import { lstat } from "node:fs/promises";
 import * as vscode from "vscode";
 import { LivePreviewEditCoordinator } from "./livePreviewEditCoordinator";
 import { LivePreviewEditHost, hostDocumentChanges } from "./livePreviewEditHost";
@@ -10,9 +9,7 @@ import { openSourceWithSelection, triggerNativeAi, addSelectionToChat } from "./
 import { aiLog } from "./ai/aiLog";
 import { clampOffsetRange, cmToHostOffsets } from "../shared/ranges";
 import { DEFAULT_LINE_WIDTH, normalizeSettings } from "../shared/settings";
-import { resolveNewNoteName } from "./vault/newNote";
-import { attachmentName, dedupeName } from "./vault/attachment";
-import { exclusiveCreate, providerExclusiveCreate } from "./vault/exclusiveCreate";
+import { createNoteFolderCreation } from "./vault/noteFolderCreationHost";
 import { SerialQueue } from "./serialQueue";
 import { LivePreviewSaveCoordinator } from "./livePreviewSaveCoordinator";
 import type {
@@ -70,8 +67,6 @@ type PanelRecord = {
   panel: vscode.WebviewPanel;
 };
 
-type DestinationKind = "symlink" | "present" | "absent";
-
 // ---------------------------------------------------------------------------
 // CustomTextEditorProvider
 // ---------------------------------------------------------------------------
@@ -79,6 +74,8 @@ type DestinationKind = "symlink" | "present" | "absent";
 export class OfmCustomTextEditorProvider
   implements vscode.CustomTextEditorProvider
 {
+  private readonly noteFolderCreation = createNoteFolderCreation();
+
   /**
    * Registry of active webview panels, keyed by document URI string. Stores the
    * document too so an image-index change can recompute the image map for every
@@ -588,151 +585,65 @@ export class OfmCustomTextEditorProvider
     await this.offerCreateNote(document, note);
   }
 
-  /**
-   * Create-on-click for an unresolved `[[wikilink]]`: confirm, write a stub
-   * `<basename>.md` in the current note's folder, then open it. The filename is
-   * derived by the pure `resolveNewNoteName` (basename only — no directories,
-   * no path traversal). The stub goes through createInNoteFolder, shared with
-   * attachment saves: a symlink at the destination name fails the create, and
-   * other schemes rename a temporary file onto the name without overwrite.
-   */
+  /** Present confirmation and map completed Note-folder creation outcomes. */
   private async offerCreateNote(
     document: vscode.TextDocument,
     target: string
   ): Promise<void> {
-    const filename = resolveNewNoteName(target);
-    if (!filename) {
-      vscode.window.showInformationMessage(`Could not find note: ${target}`);
-      return;
-    }
-    const dir = vscode.Uri.joinPath(document.uri, "..");
-    const fileUri = vscode.Uri.joinPath(dir, filename);
-
-    // A real non-symlink file is opened. A missing name is created. A symlink
-    // fails the create and is not opened.
-    if ((await this.destinationKind(fileUri)) !== "present") {
+    const result = await this.noteFolderCreation.createNote(document.uri, target, async () => {
       const CREATE = "Create note";
-      const choice = await vscode.window.showInformationMessage(
-        `"${target}" doesn't exist yet. Create it?`,
-        CREATE
-      );
-      if (choice !== CREATE) return;
-      const title = filename.replace(/\.md$/i, "");
-      const content = new TextEncoder().encode(`# ${title}\n\n`);
-      try {
-        await this.createInNoteFolder(fileUri, content);
-      } catch (e) {
+      return await vscode.window.showInformationMessage(
+        `"${target}" doesn't exist yet. Create it?`, CREATE
+      ) === CREATE;
+    });
+    switch (result.kind) {
+      case "invalid-target":
+        vscode.window.showInformationMessage(`Could not find note: ${target}`);
+        return;
+      case "cancelled":
+        return;
+      case "failed":
         vscode.window.showErrorMessage(
-          `Flintmark: couldn't create ${filename}: ${(e as Error).message}`
+          `Flintmark: couldn't create ${result.filename}: ${(result.error as Error).message}`
         );
         return;
-      }
+      case "existing":
+      case "created":
+        await vscode.commands.executeCommand("vscode.openWith", result.uri, "ofm.livePreview");
     }
-
-    await vscode.commands.executeCommand("vscode.openWith", fileUri, "ofm.livePreview");
   }
-
-  // -----------------------------------------------------------------------
-  // Image paste/drop: write the bytes as an attachment next to the note, then
-  // tell the webview the embed name to insert. Image MIME types only (the pure
-  // attachmentName refuses anything else), with a size cap. The bytes go
-  // through createInNoteFolder, like a new note.
-  // -----------------------------------------------------------------------
-
-  private static readonly MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024;
 
   private async handleSaveAttachment(
     document: vscode.TextDocument,
     panel: vscode.WebviewPanel,
     msg: Extract<WebviewMsg, { type: "saveAttachment" }>
   ): Promise<void> {
-    const d = new Date();
-    const p2 = (n: number) => String(n).padStart(2, "0");
-    const stamp = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
-
-    const name = attachmentName(msg.filename, msg.mime, stamp);
-    if (!name) {
-      vscode.window.showWarningMessage("Flintmark: only image attachments can be pasted.");
-      return;
-    }
-
-    let bytes: Uint8Array;
-    try {
-      bytes = Uint8Array.from(Buffer.from(msg.dataBase64, "base64"));
-    } catch {
-      return;
-    }
-    if (bytes.length === 0 || bytes.length > OfmCustomTextEditorProvider.MAX_ATTACHMENT_BYTES) {
-      vscode.window.showWarningMessage("Flintmark: attachment is empty or too large (max 24 MB).");
-      return;
-    }
-
-    const dir = vscode.Uri.joinPath(document.uri, "..");
-    let finalName = name;
-    let target = vscode.Uri.joinPath(dir, finalName);
-    for (let i = 1; i < 1000 && (await this.destinationKind(target)) === "present"; i++) {
-      finalName = dedupeName(name, i);
-      target = vscode.Uri.joinPath(dir, finalName);
-    }
-    // The loop can exit at the cap with the last candidate still taken — never
-    // overwrite an existing attachment in that (pathological) case. A symlink
-    // is not taken: createInNoteFolder fails instead of skipping the link.
-    if ((await this.destinationKind(target)) === "present") {
-      vscode.window.showErrorMessage(
-        "Flintmark: too many attachments with that name — rename and retry."
-      );
-      return;
-    }
-
-    try {
-      await this.createInNoteFolder(target, bytes);
-    } catch (e) {
-      vscode.window.showErrorMessage(
-        `Flintmark: couldn't save attachment: ${(e as Error).message}`
-      );
-      return;
-    }
-
-    this.imageIndex?.ensureFreshForDocument(document.uri, "attachment-saved");
-    const reply: HostMsg = { type: "attachmentSaved", requestId: msg.requestId, embed: finalName };
-    panel.webview.postMessage(reply);
-  }
-
-  /** Classify the destination name. File-scheme entries use `lstat`, so a
-   * symlink is the name itself. Other schemes use the file-system provider:
-   * their note folder is not the extension host's `fsPath`. */
-  private async destinationKind(uri: vscode.Uri): Promise<DestinationKind> {
-    if (uri.scheme === "file") {
-      try {
-        const st = await lstat(uri.fsPath);
-        return st.isSymbolicLink() ? "symlink" : "present";
-      } catch {
-        return "absent";
+    const result = await this.noteFolderCreation.saveAttachment(document.uri, msg);
+    switch (result.kind) {
+      case "unsupported-image":
+        vscode.window.showWarningMessage("Flintmark: only image attachments can be pasted.");
+        return;
+      case "decode-failed":
+        return;
+      case "invalid-size":
+        vscode.window.showWarningMessage("Flintmark: attachment is empty or too large (max 24 MB).");
+        return;
+      case "exhausted":
+        vscode.window.showErrorMessage(
+          "Flintmark: too many attachments with that name — rename and retry."
+        );
+        return;
+      case "failed":
+        vscode.window.showErrorMessage(
+          `Flintmark: couldn't save attachment: ${(result.error as Error).message}`
+        );
+        return;
+      case "saved": {
+        this.imageIndex?.ensureFreshForDocument(document.uri, "attachment-saved");
+        const reply: HostMsg = { type: "attachmentSaved", requestId: msg.requestId, embed: result.embed };
+        panel.webview.postMessage(reply);
       }
     }
-    try {
-      const stat = await vscode.workspace.fs.stat(uri);
-      return (stat.type & vscode.FileType.SymbolicLink) !== 0 ? "symlink" : "present";
-    } catch {
-      return "absent";
-    }
-  }
-
-  /** Write a new file in the note folder. A symlink fails before any write.
-   * Local files use one exclusive create; other schemes use their provider so
-   * the bytes land in that note folder rather than on the extension host,
-   * through a temporary file renamed onto the name without overwrite. */
-  private async createInNoteFolder(uri: vscode.Uri, bytes: Uint8Array): Promise<void> {
-    if ((await this.destinationKind(uri)) === "symlink") {
-      throw new Error("destination is a symlink");
-    }
-    if (uri.scheme === "file") {
-      await exclusiveCreate(uri, bytes);
-      return;
-    }
-    await providerExclusiveCreate(vscode.workspace.fs, uri, bytes, (dest, name) =>
-      vscode.Uri.joinPath(dest, "..", name)
-    );
   }
 
   // -----------------------------------------------------------------------
