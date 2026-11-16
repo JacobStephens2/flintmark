@@ -19,6 +19,15 @@ recovery, and supplies conflict state to the Save barrier.
 The [Live Preview edit module](src/extension/livePreviewEditCoordinator.ts) owns
 this protocol behind a host-independent interface.
 
+## Note-folder creation
+
+The shared operation that derives a destination beside a note and creates a
+note or image attachment while preserving validation, collision, and
+no-overwrite rules.
+
+The [Note-folder creation module](src/extension/vault/noteFolderCreation.ts)
+owns naming and creation policy behind a host-independent interface.
+
 ## Save barrier
 
 The handshake that asks every ready Live Preview peer of one document to submit

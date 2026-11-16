@@ -1,4 +1,4 @@
-// Minimal vscode stand-in for the exclusive-create host regression.
+// Minimal vscode stand-in for Note-folder creation adapter and editor tests.
 // The fs methods are replaced by the test; a successful stat is not proof the
 // name is a file.
 import { dirname, join } from "node:path";
@@ -14,6 +14,9 @@ export class Uri {
   }
   static file(p: string): Uri {
     return new Uri("file", p, p);
+  }
+  toString(): string {
+    return `${this.scheme}:${this.path}`;
   }
   // The real Uri.joinPath uses the platform separator. A slash-only join
   // leaves `C:\notes\Current.md/Free note.md` on Windows, so the create
@@ -46,7 +49,12 @@ export const env = { appName: "test", openExternal: async () => false };
 export const window = {
   errors: [] as string[],
   warnings: [] as string[],
-  showInformationMessage: async (): Promise<string> => "Create note",
+  information: [] as string[],
+  choice: "Create note" as string | undefined,
+  showInformationMessage: async (message: string): Promise<string | undefined> => {
+    window.information.push(message);
+    return window.choice;
+  },
   showErrorMessage: async (m: string): Promise<void> => {
     window.errors.push(m);
   },
@@ -80,5 +88,9 @@ export const workspace = {
   onDidChangeTextDocument: () => ({ dispose() {} }),
   onWillSaveTextDocument: () => ({ dispose() {} }),
   onDidSaveTextDocument: () => ({ dispose() {} }),
+  onDidChangeConfiguration: () => ({ dispose() {} }),
+  getWorkspaceFolder: () => undefined,
+  workspaceFolders: [],
+  findFiles: async () => [],
   getConfiguration: () => ({ get: () => undefined }),
 };
