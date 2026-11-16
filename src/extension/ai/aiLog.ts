@@ -30,7 +30,16 @@ function write(msg: string): void {
   const line = `${new Date().toISOString().slice(11, 23)}  ${msg}`;
   chan().appendLine(line);
   try {
-    fs.appendFileSync(LOG_FILE, line + "\n");
+    const fd = fs.openSync(
+      LOG_FILE,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW,
+      0o600
+    );
+    try {
+      fs.appendFileSync(fd, line + "\n");
+    } finally {
+      fs.closeSync(fd);
+    }
   } catch {
     /* best-effort file mirror */
   }

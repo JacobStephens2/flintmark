@@ -235,7 +235,7 @@
         "ofm.ai.debugLog": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Trace the AI Selection Bridge to the **Flintmark AI** output channel (and `/tmp/flintmark-ai.log`) for diagnosing AI integration on a given IDE. Off by default; turn on only when troubleshooting."
+          "markdownDescription": "Trace the AI Selection Bridge to the **Flintmark AI** output channel and `flintmark-ai.log` in the system temporary directory. New log files have owner-only read/write permissions, and symlink destinations are refused, where supported by the OS. Logs may include file paths and selection ranges. Off by default; turn on only when troubleshooting."
         }
       }
     },
