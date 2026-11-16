@@ -13,6 +13,9 @@ import { join, resolve } from "node:path";
 
 function vscodeAliasFor(file) {
   const resolved = resolve(file);
+  if (resolved === resolve("test/ai/aiLog.test.ts")) {
+    return { vscode: resolve("test/fixtures/aiLogVscode.ts") };
+  }
   if (resolved === resolve("test/vault/workspaceIndexDriver.test.ts")) {
     return {
       vscode: resolve("test/fixtures/workspaceIndexVscode.ts"),
