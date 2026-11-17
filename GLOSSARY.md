@@ -37,3 +37,13 @@ persistence. Hidden ready peers participate too.
 
 The [Live Preview save module](src/extension/livePreviewSaveCoordinator.ts) owns
 the barrier and the persistence lifecycle shared by preview and native saves.
+
+## Vault index publication
+
+The process that orders content refreshes and cooperative rebuilds of per-root
+note snapshots into the last complete, globally queryable graph, original URI
+lookup, and autocomplete data.
+
+The [Vault index publication module](src/extension/vault/vaultPublication.ts)
+owns publication ordering and the queries it protects behind a host-independent
+interface.
