@@ -1,29 +1,19 @@
 import { readIndexFile } from "./readIndexFile";
 // Vault Index · thin VS Code adapter (MAY import vscode).
 //
-// All real logic lives in the pure core (vaultIndex.ts / linkParser.ts). This
-// file only does host plumbing: scan `.md` Notes, read their text, build the
-// index, and keep it fresh via a FileSystemWatcher. It exposes the same query
-// surface as the core, mapping between VS Code Uris and the core's opaque path
-// strings (here: `uri.toString()`).
-//
-// NOT wired into activate.ts — the host wires this in later. Typical use:
+// Publication ordering and queries live in vaultPublication.ts; the driver
+// owns scanning and watching. This adapter reads/patches root note snapshots
+// and converts VS Code query arguments to opaque URI strings.
+// Typical use:
 //   const svc = new VaultIndexService();
 //   await svc.initialize();
 //   context.subscriptions.push(svc);
 //   const uri = svc.resolveLinkUri("Some Note");
 
 import * as vscode from "vscode";
-import {
-  buildVaultIndex,
-  buildVaultIndexCooperatively,
-  NoteEntry,
-  NoteInput,
-  VaultIndex,
-  VaultIndexBuildCancelled,
-} from "./vaultIndex";
+import type { NoteEntry, NoteInput } from "./vaultIndex";
+import { VaultPublication } from "./vaultPublication";
 import type { VaultData } from "../../shared/protocol";
-import { copyVaultData } from "../../shared/vaultData";
 import { waitForVaultBuildGate } from "./vaultBuildGate";
 import { mapInCooperativeBatches } from "./cooperativeBatches";
 import { patchNoteSnapshot, type NoteSnapshot } from "./vaultSnapshot";
@@ -38,7 +28,6 @@ import {
 const MD_GLOB = "**/*.{md,markdown}";
 const REBUILD_DEBOUNCE_MS = 50;
 const READ_CONCURRENCY = 32;
-const BUILD_SLICE_MS = 8;
 
 type VaultRootSnapshot = NoteSnapshot<vscode.Uri>;
 
@@ -50,18 +39,11 @@ export class VaultIndexService implements vscode.Disposable {
   private readonly driver: WorkspaceIndexDriver;
   private readonly ownsDriver: boolean;
   private readonly handle: WorkspaceIndexHandle<VaultRootSnapshot>;
-  private index: VaultIndex = buildVaultIndex([]);
-  private uris = new Map<string, vscode.Uri>();
-  private vaultData: VaultData = { notes: [], tags: [] };
+  private readonly publication: VaultPublication<vscode.Uri>;
   private readonly refreshSub: vscode.Disposable;
   private readonly decoder = new TextDecoder();
-  private rebuildGeneration = 0;
-  private fullRebuildInFlight: number | undefined;
-  private rebuildPending = false;
-  private rebuildPromise: Promise<void> = Promise.resolve();
-  private disposed = false;
 
-  /** Fires after every (debounced) rebuild so views can refresh (e.g. push
+  /** Fires after every publication so views can refresh (e.g. push
    *  fresh autocomplete data to webviews). */
   private readonly _onDidChange = new vscode.EventEmitter<void>();
   readonly onDidChange = this._onDidChange.event;
@@ -80,54 +62,62 @@ export class VaultIndexService implements vscode.Disposable {
       patchSnapshot: (_root, snapshot, patch, context) =>
         this.patchSnapshot(snapshot, patch, context),
     });
+    this.publication = new VaultPublication({
+      snapshot: (root) => this.handle.snapshot(root),
+      snapshots: () => this.handle.snapshots().map(({ snapshot }) => snapshot),
+      requestRefresh: (root, reason) => this.handle.requestRefresh(root, reason, true),
+    }, {
+      onDidChange: () => this._onDidChange.fire(),
+      onError: (error) => console.error("[ofm] vault index rebuild failed", error),
+    });
     this.refreshSub = this.driver.onDidRefresh((event) => {
       if (event.kind !== "note") return;
-      if (event.mode === "content") this.applyContentRefresh(event.root, event.changedUris);
-      else this.scheduleGlobalRebuild();
+      if (event.mode === "content") {
+        this.publication.refreshContent(event.root, event.changedUris.map((uri) => uri.toString()));
+      } else this.publication.requestRebuild();
     });
   }
 
   /** Scan the workspace and start watching. Safe to await once at activation. */
   async initialize(): Promise<void> {
     await this.driver.initialize();
-    await this.rebuildPromise;
+    await this.publication.waitForCurrentBuild();
   }
 
   // ----- queries (delegate straight to the pure core) --------------------
 
   getAllNotes(): NoteEntry[] {
-    return this.index.getAllNotes();
+    return this.publication.getAllNotes();
   }
   getBacklinks(uri: vscode.Uri): string[] {
-    return this.index.getBacklinks(uri.toString());
+    return this.publication.getBacklinks(uri.toString());
   }
   getOutgoingLinks(uri: vscode.Uri): string[] {
-    return this.index.getOutgoingLinks(uri.toString());
+    return this.publication.getOutgoingLinks(uri.toString());
   }
   getUnresolvedLinks(uri: vscode.Uri): string[] {
-    return this.index.getUnresolvedLinks(uri.toString());
+    return this.publication.getUnresolvedLinks(uri.toString());
   }
   getTagged(tag: string): string[] {
-    return this.index.getTagged(tag);
+    return this.publication.getTagged(tag);
   }
   getAllTags(): string[] {
-    return this.index.getAllTags();
+    return this.publication.getAllTags();
   }
 
   /** Compact data for webview autocomplete: deduped note names + all tags. */
   getVaultData(): VaultData {
-    return copyVaultData(this.vaultData);
+    return this.publication.getVaultData();
   }
 
   /** Resolve a wikilink target name → Note path string, or null. */
   resolveLink(name: string): string | null {
-    return this.index.resolveLink(name);
+    return this.publication.resolveLink(name);
   }
 
   /** Resolve a wikilink target name → openable Uri, or undefined. */
   resolveLinkUri(name: string): vscode.Uri | undefined {
-    const path = this.index.resolveLink(name);
-    return path ? this.uris.get(path) : undefined;
+    return this.publication.resolveLinkUri(name);
   }
 
   private async buildSnapshot(
@@ -185,104 +175,10 @@ export class VaultIndexService implements vscode.Disposable {
     );
   }
 
-  private scheduleGlobalRebuild(): void {
-    if (this.fullRebuildInFlight !== undefined) {
-      this.rebuildPending = true;
-      return;
-    }
-    const generation = ++this.rebuildGeneration;
-    this.fullRebuildInFlight = generation;
-    const promise = this.rebuildGlobalSnapshot(generation);
-    this.rebuildPromise = promise;
-    void promise;
-  }
-
-  private async rebuildGlobalSnapshot(generation: number): Promise<void> {
-    const inputs: NoteInput[] = [];
-    const uris = new Map<string, vscode.Uri>();
-    for (const { snapshot } of this.handle.snapshots()) {
-      inputs.push(...snapshot.inputs.values());
-      for (const [key, uri] of snapshot.uris) uris.set(key, uri);
-    }
-    try {
-      const index = await buildVaultIndexCooperatively(inputs, {
-        now: monotonicNow,
-        yieldNow: yieldImmediate,
-        shouldCancel: () => this.disposed || generation !== this.rebuildGeneration,
-        maxSliceMs: BUILD_SLICE_MS,
-      });
-      if (this.disposed || generation !== this.rebuildGeneration) return;
-      const vaultData = makeVaultData(index);
-      // One synchronous publication transaction: no observer can see a new
-      // graph paired with old URI/VaultData caches.
-      this.index = index;
-      this.uris = uris;
-      this.vaultData = vaultData;
-      this._onDidChange.fire();
-    } catch (error) {
-      if (error instanceof VaultIndexBuildCancelled) return;
-      // Retain the last complete index. A later dirty/notReady document request
-      // will retry because only successful publication advances freshness.
-      console.error("[ofm] vault index rebuild failed", error);
-    } finally {
-      if (this.fullRebuildInFlight === generation) this.fullRebuildInFlight = undefined;
-      if (!this.disposed && this.rebuildPending) {
-        this.rebuildPending = false;
-        this.scheduleGlobalRebuild();
-      }
-    }
-  }
-
-  private applyContentRefresh(root: vscode.Uri, changedUris: readonly vscode.Uri[]): void {
-    const snapshot = this.handle.snapshot(root);
-    const inputs = changedUris.flatMap((uri) => {
-      const input = snapshot?.inputs.get(uri.toString());
-      return input ? [input] : [];
-    });
-    if (!snapshot || inputs.length !== changedUris.length) {
-      this.handle.requestRefresh(root, "content-patch-missing", true);
-      return;
-    }
-    // A structural snapshot may be newer than the currently published graph.
-    // Rebuild from the driver's latest (already content-patched) snapshots so
-    // cancelling that build cannot discard creates/deletes/renames.
-    if (this.fullRebuildInFlight !== undefined) {
-      this.scheduleGlobalRebuild();
-      return;
-    }
-    // Cancel any cooperative full rebuild before mutating the last published
-    // graph. Validate the entire batch first so publication is all-or-nothing.
-    this.rebuildGeneration++;
-    if (inputs.some((input) => !this.index.getNote(input.path))) {
-      this.handle.requestRefresh(root, "content-patch-index-missing", true);
-      return;
-    }
-    for (const input of inputs) this.index.replaceNoteContent(input);
-    this.vaultData = makeVaultData(this.index);
-    this.rebuildPromise = Promise.resolve();
-    this._onDidChange.fire();
-  }
-
   dispose(): void {
-    this.disposed = true;
-    this.rebuildGeneration++;
+    this.publication.dispose();
     this.refreshSub.dispose();
     this._onDidChange.dispose();
     if (this.ownsDriver) this.driver.dispose();
   }
-}
-
-function makeVaultData(index: VaultIndex): VaultData {
-  const notes = [
-    ...new Set(index.getAllNotes().map((note) => note.name).filter((name) => name.length > 0)),
-  ].sort();
-  return { notes, tags: index.getAllTags() };
-}
-
-function monotonicNow(): number {
-  return globalThis.performance?.now() ?? Date.now();
-}
-
-function yieldImmediate(): Promise<void> {
-  return new Promise((resolve) => setImmediate(resolve));
 }

@@ -271,6 +271,70 @@ async function main() {
   }
   {
     const uri = (path: string) => host.Uri.from({ scheme: 'custom', path });
+    const alpha = uri('/publication/Alpha.md');
+    const beta = uri('/publication/Beta.md');
+    host.reset(uri('/publication'), [], [alpha, beta]);
+    host.noteTexts.set(alpha.path, '[[Beta]] #before');
+    const driver = new WorkspaceIndexDriver();
+    const service = new VaultIndexService(driver);
+    const images = new ImageIndexService(driver);
+    const publications: { tags: string[]; backlinks: string[]; unresolved: string[]; notes: string[] }[] = [];
+    service.onDidChange(() => {
+      publications.push({
+        tags: service.getVaultData().tags,
+        notes: service.getVaultData().notes,
+        backlinks: service.getBacklinks(beta),
+        unresolved: service.getUnresolvedLinks(alpha),
+      });
+    });
+    let imagePublications = 0;
+    images.onDidChange(() => { imagePublications++; });
+    const waitFor = async (condition: () => boolean) => {
+      const deadline = performance.now() + 2000;
+      while (!condition() && performance.now() < deadline) await sleep(10);
+      assert.ok(condition(), 'host refresh reaches its publication interface');
+    };
+    try {
+      assert.deepEqual(service.getVaultData(), { notes: [], tags: [] });
+      await service.initialize();
+      assert.equal(service.resolveLinkUri('Beta'), beta, 'preserves the original host URI object');
+      assert.equal(service.resolveLink('Beta'), beta.toString());
+      assert.deepEqual(service.getOutgoingLinks(alpha), [beta.toString()]);
+      assert.deepEqual(service.getTagged('#before'), [alpha.toString()]);
+      assert.deepEqual(service.getAllTags(), ['before']);
+      assert.deepEqual(publications, [{ notes: ['Alpha', 'Beta'], tags: ['before'], backlinks: [alpha.toString()], unresolved: [] }]);
+      host.noteTexts.set(alpha.path, '[[Missing]] #after');
+      const scans = host.calls.noteScan;
+      host.changeLeaf('note', alpha);
+      await waitFor(() => publications.length === 2);
+      assert.deepEqual(publications[1], { notes: ['Alpha', 'Beta'], tags: ['after'], backlinks: [], unresolved: ['Missing'] });
+      assert.equal(host.calls.noteScan, scans, 'content refresh reaches the module without a new scan');
+      const gamma = uri('/publication/Gamma.md');
+      host.createLeaf('note', gamma);
+      await waitFor(() => publications.length === 3);
+      assert.deepEqual(service.getAllNotes().map((note) => note.name), ['Alpha', 'Beta', 'Gamma']);
+      assert.equal(service.resolveLinkUri('Gamma'), gamma);
+      const previousImages = imagePublications;
+      host.createLeaf('image', uri('/publication/image.png'));
+      await waitFor(() => imagePublications > previousImages);
+      assert.equal(publications.length, 3, 'non-note refreshes do not publish the note graph');
+      service.dispose();
+      const beforeSharedRefresh = imagePublications;
+      host.createLeaf('image', uri('/publication/shared.png'));
+      await waitFor(() => imagePublications > beforeSharedRefresh);
+      assert.equal(publications.length, 3, 'disposing the adapter detaches its change subscription');
+      console.log('✓ Vault host delegates note refreshes and coherent queries while preserving shared driver lifetime');
+    } catch (error) {
+      failures++;
+      console.error('✗ Vault host delegates note refreshes and coherent queries while preserving shared driver lifetime', error);
+    } finally {
+      service.dispose();
+      images.dispose();
+      driver.dispose();
+    }
+  }
+  {
+    const uri = (path: string) => host.Uri.from({ scheme: 'custom', path });
     const notes = Array.from({ length: 1500 }, (_, i) => uri(`/busy/Note-${i}.md`));
     host.reset(uri('/busy'), [], notes);
     const links = Array.from({ length: 150 }, (_, i) => `[[Note-${i}]]`).join(' ');
