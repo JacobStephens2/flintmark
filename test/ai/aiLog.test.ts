@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { logState } from "../fixtures/aiLogVscode";
@@ -30,6 +31,13 @@ async function main(): Promise<void> {
     assert.equal(readFileSync(LOG_FILE, "utf8"), expected);
     console.log("  ✓ forced diagnostics bypass the setting and enabled tracing appends the same timestamped lines as the channel");
 
+    const assertChannelAcceptsBoth = (label: string): void => {
+      assert.doesNotThrow(() => aiLogForce(`${label} diagnostic`));
+      assert.doesNotThrow(() => aiLog(`${label} trace`));
+      assert.ok(logState.lines.at(-2)!.endsWith(`  ${label} diagnostic`));
+      assert.ok(logState.lines.at(-1)!.endsWith(`  ${label} trace`));
+    };
+
     if (process.platform !== "win32") {
       assert.equal(statSync(LOG_FILE).mode & 0o777, 0o600);
       console.log("  ✓ new AI log files are readable and writable only by their owner, even with a permissive umask");
@@ -52,14 +60,80 @@ async function main(): Promise<void> {
       assert.equal(lstatSync(LOG_FILE).isSymbolicLink(), true);
       assert.match(logState.lines.at(-1)!, /  refused dangling symlink trace$/);
       console.log("  ✓ dangling symlinks cannot create a target and enabled tracing still reaches the output channel");
+
+      rmSync(LOG_FILE);
+      execFileSync("mkfifo", [LOG_FILE]);
+      chmodSync(LOG_FILE, 0o600);
+      const fifoMode = lstatSync(LOG_FILE).mode & 0o777;
+      const readerFd = openSync(LOG_FILE, constants.O_RDONLY | constants.O_NONBLOCK);
+      try {
+        assertChannelAcceptsBoth("refused fifo");
+        const buf = Buffer.alloc(1024);
+        let bytesRead = 0;
+        try {
+          bytesRead = readSync(readerFd, buf, 0, buf.length, null);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EAGAIN") throw error;
+        }
+        assert.equal(bytesRead, 0);
+        assert.equal(lstatSync(LOG_FILE).isFIFO(), true);
+        assert.equal(lstatSync(LOG_FILE).mode & 0o777, fifoMode);
+      } finally {
+        closeSync(readerFd);
+      }
+      assert.doesNotThrow(() => aiLog("refused fifo without reader"));
+      assert.match(logState.lines.at(-1)!, /  refused fifo without reader$/);
+      console.log("  ✓ non-regular descriptors (FIFO) are refused without writing or modifying permissions");
+
+      for (const mode of [0o640, 0o620, 0o610, 0o604, 0o602, 0o601, 0o644, 0o666]) {
+        rmSync(LOG_FILE);
+        writeFileSync(LOG_FILE, "existing\n");
+        chmodSync(LOG_FILE, mode);
+        assertChannelAcceptsBoth(`refused mode ${mode.toString(8)}`);
+        assert.equal(readFileSync(LOG_FILE, "utf8"), "existing\n");
+        assert.equal(statSync(LOG_FILE).mode & 0o777, mode);
+      }
+      console.log("  ✓ existing files with group or other permission bits are refused without modifying permissions");
+
+      rmSync(LOG_FILE);
+      writeFileSync(LOG_FILE, "prior\n");
+      chmodSync(LOG_FILE, 0o600);
+      aiLog("recovered into compliant file");
+      assert.equal(readFileSync(LOG_FILE, "utf8"), "prior\n" + logState.lines.at(-1) + "\n");
+      chmodSync(LOG_FILE, 0o700);
+      aiLog("owner-only 700 trace");
+      assert.equal(
+        readFileSync(LOG_FILE, "utf8"),
+        "prior\n" + logState.lines.slice(-2).map(line => line + "\n").join("")
+      );
+      assert.equal(statSync(LOG_FILE).mode & 0o777, 0o700);
+      console.log("  ✓ file logging resumes once replaced by a compliant owner-only file");
+
+      if (typeof process.geteuid === "function") {
+        rmSync(LOG_FILE);
+        writeFileSync(LOG_FILE, "foreign-owner\n");
+        chmodSync(LOG_FILE, 0o600);
+        const previousGeteuid = process.geteuid;
+        const foreignUid = previousGeteuid() + 1;
+        process.geteuid = () => foreignUid;
+        try {
+          assertChannelAcceptsBoth("refused foreign owner");
+        } finally {
+          process.geteuid = previousGeteuid;
+        }
+        assert.equal(readFileSync(LOG_FILE, "utf8"), "foreign-owner\n");
+        assert.equal(statSync(LOG_FILE).mode & 0o777, 0o600);
+        console.log("  ✓ files not owned by the current user are refused without modifying permissions");
+
+        aiLog("recovered for owner");
+        assert.equal(readFileSync(LOG_FILE, "utf8"), "foreign-owner\n" + logState.lines.at(-1) + "\n");
+        console.log("  ✓ file logging resumes for a compliant owner-matched file");
+      }
     }
 
     rmSync(LOG_FILE, { force: true });
     mkdirSync(LOG_FILE);
-    assert.doesNotThrow(() => aiLogForce("failed file diagnostic"));
-    assert.match(logState.lines.at(-1)!, /  failed file diagnostic$/);
-    assert.doesNotThrow(() => aiLog("failed file trace"));
-    assert.match(logState.lines.at(-1)!, /  failed file trace$/);
+    assertChannelAcceptsBoth("failed file");
     console.log("  ✓ file failures remain best-effort for both forced and automatic logging");
 
     rmSync(LOG_FILE, { recursive: true });
