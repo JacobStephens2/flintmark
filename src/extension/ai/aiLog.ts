@@ -26,16 +26,29 @@ function debugLogEnabled(): boolean {
   return vscode.workspace.getConfiguration("ofm").get<boolean>("ai.debugLog") === true;
 }
 
+function isTrustedLogDescriptor(stat: fs.Stats): boolean {
+  if (!stat.isFile()) return false;
+  if (process.platform === "win32") return true;
+  const uid = process.geteuid?.() ?? process.getuid?.();
+  if (uid !== undefined && stat.uid !== uid) return false;
+  return (stat.mode & 0o077) === 0;
+}
+
 function write(msg: string): void {
   const line = `${new Date().toISOString().slice(11, 23)}  ${msg}`;
   chan().appendLine(line);
   try {
     const fd = fs.openSync(
       LOG_FILE,
-      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW,
+      fs.constants.O_WRONLY |
+        fs.constants.O_CREAT |
+        fs.constants.O_APPEND |
+        (fs.constants.O_NOFOLLOW ?? 0) |
+        (fs.constants.O_NONBLOCK ?? 0),
       0o600
     );
     try {
+      if (!isTrustedLogDescriptor(fs.fstatSync(fd))) return;
       fs.appendFileSync(fd, line + "\n");
     } finally {
       fs.closeSync(fd);

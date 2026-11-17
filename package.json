@@ -235,7 +235,7 @@
         "ofm.ai.debugLog": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Trace the AI Selection Bridge to the **Flintmark AI** output channel and `flintmark-ai.log` in the system temporary directory. New log files have owner-only read/write permissions, and symlink destinations are refused, where supported by the OS. Logs may include file paths and selection ranges. Off by default; turn on only when troubleshooting."
+          "markdownDescription": "Trace the AI Selection Bridge to the **Flintmark AI** output channel and `flintmark-ai.log` in the system temporary directory. New log files have owner-only read/write permissions; file logging refuses symlinks and any destination that is not a regular file owned by the current user with no group or other permissions (where supported by the OS), leaving existing permissions unchanged while output-channel logging continues. Logs may include file paths and selection ranges. Off by default; turn on only when troubleshooting."
         }
       }
     },
