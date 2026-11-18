@@ -1,4 +1,4 @@
-import { IMAGE_EXTS, parseEmbedInner } from "./vault/imageResolver";
+import { hasImageExtension, parseEmbedInner } from "./vault/imageResolver";
 
 const LPAREN = 40; // (
 const RPAREN = 41; // )
@@ -26,11 +26,6 @@ function isRemoteReference(reference: string): boolean {
     reference.startsWith("http:") ||
     reference.startsWith("data:")
   );
-}
-
-function imageExtension(pathPart: string): string {
-  const dot = pathPart.lastIndexOf(".");
-  return dot >= 0 ? pathPart.slice(dot + 1).toLowerCase() : "";
 }
 
 /** Scan `![alt](src)` in linear time by advancing past each unmatched `]`. */
@@ -124,7 +119,7 @@ export class LivePreviewImagePublication {
     scanMarkdownImages(text, (src) => put(src, false));
     scanImageEmbeds(text, (inner) => {
       const { pathPart } = parseEmbedInner(inner);
-      if (IMAGE_EXTS.has(imageExtension(pathPart))) put(pathPart, true);
+      if (hasImageExtension(pathPart)) put(pathPart, true);
     });
 
     // The entire resolved URI participates, including Image snapshot versions.

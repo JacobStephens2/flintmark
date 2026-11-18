@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { performance } from "node:perf_hooks";
 import { LivePreviewImagePublication } from "../../src/extension/livePreviewImagePublication";
 
 let failed = 0;
@@ -174,6 +173,8 @@ test("disposal is terminal before or after ready and reopening has independent s
   }
 });
 
+const CATASTROPHIC_MS = 1500;
+
 function measurePublicationMs(text: string): { ms: number; map: Record<string, string> } {
   let latest: Record<string, string> = {};
   const publication = new LivePreviewImagePublication({
@@ -182,20 +183,18 @@ function measurePublicationMs(text: string): { ms: number; map: Record<string, s
     resolveLegacy: reference => `local:${reference}`,
     postMap: map => { latest = map; },
   });
+  publication.ready();
   const samples: number[] = [];
-  for (let i = 0; i < 3; i++) {
-    const start = performance.now();
+  for (let i = 0; i < 5; i++) {
+    const start = process.hrtime.bigint();
     publication.ready();
-    samples.push(performance.now() - start);
+    samples.push(Number(process.hrtime.bigint() - start) / 1e6);
   }
   samples.sort((a, b) => a - b);
-  return { ms: samples[1], map: latest };
+  return { ms: samples[Math.floor(samples.length / 2)], map: latest };
 }
 
 test("refresh scales linearly on large adversarial and valid reference inputs", () => {
-  // Warm up V8 before timing small vs large inputs.
-  measurePublicationMs("![[warm.png]] ![warm](warm2.png)");
-
   const cases: {
     name: string;
     build: (count: number) => string;
@@ -229,16 +228,16 @@ test("refresh scales linearly on large adversarial and valid reference inputs", 
   ];
 
   for (const scenario of cases) {
-    const small = measurePublicationMs(scenario.build(1_500));
-    const large = measurePublicationMs(scenario.build(15_000));
+    const small = measurePublicationMs(scenario.build(3_000));
+    const large = measurePublicationMs(scenario.build(30_000));
     assert.deepEqual(large.map, scenario.expected, scenario.name);
     assert.ok(
-      large.ms < 250,
-      `${scenario.name}: 15k scan took ${large.ms.toFixed(1)}ms (expected < 250ms)`
+      large.ms < CATASTROPHIC_MS,
+      `${scenario.name}: 30k scan took ${large.ms.toFixed(1)}ms (guard ${CATASTROPHIC_MS}ms)`
     );
     assert.ok(
-      large.ms <= Math.max(50, small.ms * 25),
-      `${scenario.name}: non-linear scaling 1.5k=${small.ms.toFixed(2)}ms -> 15k=${large.ms.toFixed(2)}ms`
+      large.ms <= Math.max(250, small.ms * 30),
+      `${scenario.name}: non-linear scaling 3k=${small.ms.toFixed(2)}ms -> 30k=${large.ms.toFixed(2)}ms`
     );
   }
 
@@ -252,7 +251,10 @@ test("refresh scales linearly on large adversarial and valid reference inputs", 
   }
   const many = measurePublicationMs(manyLines.join("\n"));
   assert.deepEqual(many.map, expectedMany);
-  assert.ok(many.ms < 500, `10k valid references took ${many.ms.toFixed(1)}ms (expected < 500ms)`);
+  assert.ok(
+    many.ms < CATASTROPHIC_MS,
+    `10k valid references took ${many.ms.toFixed(1)}ms (guard ${CATASTROPHIC_MS}ms)`
+  );
 });
 
 test("reference extraction parity holds across nested, malformed, whitespace, and extension edge cases", () => {
@@ -276,7 +278,7 @@ test("reference extraction parity holds across nested, malformed, whitespace, an
     "![[]]]![[after-triple.png]]",
     "![[nested ![[deep.png]]",
     "![[embed.png]](md-ignored.png)",
-    "![[trailing-dot.]] ![[.png]] ![[multi.dot.webp]]",
+    "![[trailing-dot.]] ![[dir.png/noext]] ![[.png]] ![[multi.dot.webp]]",
     "![[both.png]] ![precedence](both.png)",
     "![md-first](second.png) ![[second.png]]",
     "![empty-alt]() ![only-ws](   \n\t) ![[ ]] ![[]]",

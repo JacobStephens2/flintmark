@@ -49,6 +49,11 @@ function extOf(name: string): string {
   return i >= 0 ? name.slice(i + 1).toLowerCase() : "";
 }
 
+/** Whether a path or filename ends with a supported Obsidian image extension. */
+export function hasImageExtension(name: string): boolean {
+  return IMAGE_EXTS.has(extOf(name));
+}
+
 /** Build an ImageEntry from a root-relative path string. */
 function makeEntry(relPath: string): ImageEntry {
   const rp = relPath.replace(/\\/g, "/").replace(/^\/+/, "");
@@ -171,7 +176,7 @@ export class ImageSnapshot {
     const segs = decoded.split("/").filter((s) => s.length > 0);
     if (segs.length === 0) return null;
     const base = segs[segs.length - 1];
-    if (requireImageExt && !IMAGE_EXTS.has(extOf(base))) return null;
+    if (requireImageExt && !hasImageExtension(base)) return null;
 
     // 1. Exact document-relative (covers same-folder `![[img.png]]` too).
     const relSegs = resolveDots([...docDirSegments, ...segs]);
