@@ -23,7 +23,8 @@ function vscodeAliasFor(file) {
     };
   }
   if (resolved === resolve("test/vault/exclusiveCreateHost.test.ts") ||
-      resolved === resolve("test/vault/noteFolderCreationHost.test.ts")) {
+      resolved === resolve("test/vault/noteFolderCreationHost.test.ts") ||
+      resolved === resolve("test/vault/livePreviewImagePublicationHost.test.ts")) {
     return { vscode: resolve("test/fixtures/exclusiveCreateVscode.ts") };
   }
   return undefined;

@@ -10,6 +10,16 @@ indexed resolution is available.
 The [Image snapshot module](src/extension/vault/imageResolver.ts) owns image
 membership, path patches, and resolution behind a host-independent interface.
 
+## Live Preview image publication
+
+The per-panel process that turns current note image references and Image
+snapshot resolution into complete image maps offered after initialization. It
+owns raw reference keys, synchronous indexed/fallback resolution choice,
+duplicate suppression, and resending after every ready/init handshake.
+
+The [Live Preview image publication module](src/extension/livePreviewImagePublication.ts)
+owns this process behind a host-independent interface.
+
 ## Live Preview edit synchronization
 
 The per-document protocol that orders received Live Preview input with host
