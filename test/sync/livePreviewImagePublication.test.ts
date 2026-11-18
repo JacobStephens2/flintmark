@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { performance } from "node:perf_hooks";
 import { LivePreviewImagePublication } from "../../src/extension/livePreviewImagePublication";
 
 let failed = 0;
@@ -171,6 +172,146 @@ test("disposal is terminal before or after ready and reopening has independent s
     reopened.publication.ready();
     assert.deepEqual(reopened.maps, [{ "photo.png": "local:photo.png" }]);
   }
+});
+
+function measurePublicationMs(text: string): { ms: number; map: Record<string, string> } {
+  let latest: Record<string, string> = {};
+  const publication = new LivePreviewImagePublication({
+    readText: () => text,
+    resolveIndexed: () => undefined,
+    resolveLegacy: reference => `local:${reference}`,
+    postMap: map => { latest = map; },
+  });
+  const samples: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    const start = performance.now();
+    publication.ready();
+    samples.push(performance.now() - start);
+  }
+  samples.sort((a, b) => a - b);
+  return { ms: samples[1], map: latest };
+}
+
+test("refresh scales linearly on large adversarial and valid reference inputs", () => {
+  // Warm up V8 before timing small vs large inputs.
+  measurePublicationMs("![[warm.png]] ![warm](warm2.png)");
+
+  const cases: {
+    name: string;
+    build: (count: number) => string;
+    expected: Record<string, string>;
+  }[] = [
+    {
+      name: "unclosed markdown openers",
+      build: count => "![".repeat(count),
+      expected: {},
+    },
+    {
+      name: "unclosed markdown openers sharing a non-link bracket",
+      build: count => "![".repeat(count) + "]![tail](ok-bracket.png)",
+      expected: { "ok-bracket.png": "local:ok-bracket.png" },
+    },
+    {
+      name: "unclosed markdown openers sharing an empty target",
+      build: count => "![".repeat(count) + "](   )![tail](ok-empty.png)",
+      expected: { "ok-empty.png": "local:ok-empty.png" },
+    },
+    {
+      name: "unclosed image embed openers",
+      build: count => "![[".repeat(count),
+      expected: {},
+    },
+    {
+      name: "unclosed image embed openers sharing a single bracket",
+      build: count => "![[".repeat(count) + "]![[ok-single.png]]",
+      expected: { "ok-single.png": "local:ok-single.png" },
+    },
+  ];
+
+  for (const scenario of cases) {
+    const small = measurePublicationMs(scenario.build(1_500));
+    const large = measurePublicationMs(scenario.build(15_000));
+    assert.deepEqual(large.map, scenario.expected, scenario.name);
+    assert.ok(
+      large.ms < 250,
+      `${scenario.name}: 15k scan took ${large.ms.toFixed(1)}ms (expected < 250ms)`
+    );
+    assert.ok(
+      large.ms <= Math.max(50, small.ms * 25),
+      `${scenario.name}: non-linear scaling 1.5k=${small.ms.toFixed(2)}ms -> 15k=${large.ms.toFixed(2)}ms`
+    );
+  }
+
+  const manyCount = 5_000;
+  const manyLines: string[] = [];
+  const expectedMany: Record<string, string> = {};
+  for (let i = 0; i < manyCount; i++) {
+    manyLines.push(`![alt ${i}](md-${i}.png) ![[embed-${i}.png|200]]`);
+    expectedMany[`md-${i}.png`] = `local:md-${i}.png`;
+    expectedMany[`embed-${i}.png`] = `local:embed-${i}.png`;
+  }
+  const many = measurePublicationMs(manyLines.join("\n"));
+  assert.deepEqual(many.map, expectedMany);
+  assert.ok(many.ms < 500, `10k valid references took ${many.ms.toFixed(1)}ms (expected < 500ms)`);
+});
+
+test("reference extraction parity holds across nested, malformed, whitespace, and extension edge cases", () => {
+  const maps: Record<string, string>[] = [];
+  let text = "";
+  const publication = new LivePreviewImagePublication({
+    readText: () => text,
+    resolveIndexed: (reference, requireImageExt) =>
+      `${requireImageExt ? "embed" : "md"}:${reference}`,
+    resolveLegacy: reference => `local:${reference}`,
+    postMap: map => { maps.push(map); },
+  });
+
+  text = [
+    "![outer ![inner](nested.png)",
+    "![unclosed]![second](after-bracket.png)",
+    "![empty](   )![after](after-empty.png)",
+    "![newline\nalt](\n\t spaced.png\u00a0ignored)",
+    "![[a]![[inside.png]]",
+    "![[]![[after-empty-embed.png]]",
+    "![[]]]![[after-triple.png]]",
+    "![[nested ![[deep.png]]",
+    "![[embed.png]](md-ignored.png)",
+    "![[trailing-dot.]] ![[.png]] ![[multi.dot.webp]]",
+    "![[both.png]] ![precedence](both.png)",
+    "![md-first](second.png) ![[second.png]]",
+    "![empty-alt]() ![only-ws](   \n\t) ![[ ]] ![[]]",
+    "![eof](unterminated.png",
+  ].join("\n");
+
+  publication.ready();
+  assert.deepEqual(maps, [{
+    "nested.png": "md:nested.png",
+    "after-bracket.png": "md:after-bracket.png",
+    "after-empty.png": "md:after-empty.png",
+    "spaced.png": "md:spaced.png",
+    "both.png": "md:both.png",
+    "second.png": "md:second.png",
+    "unterminated.png": "md:unterminated.png",
+    "inside.png": "embed:inside.png",
+    "after-empty-embed.png": "embed:after-empty-embed.png",
+    "after-triple.png": "embed:after-triple.png",
+    "nested ![[deep.png": "embed:nested ![[deep.png",
+    "embed.png": "embed:embed.png",
+    ".png": "embed:.png",
+    "multi.dot.webp": "embed:multi.dot.webp",
+  }]);
+
+  text = "![only-ws-eof](   \n\t";
+  publication.refresh();
+  assert.deepEqual(maps.at(-1), {});
+
+  text = "![trailing](eof-md.png)![unclosed]";
+  publication.refresh();
+  assert.deepEqual(maps.at(-1), { "eof-md.png": "md:eof-md.png" });
+
+  text = "![[unclosed.png]";
+  publication.refresh();
+  assert.deepEqual(maps.at(-1), {});
 });
 
 if (failed) process.exitCode = 1;
