@@ -12,6 +12,8 @@ import { DEFAULT_LINE_WIDTH, normalizeSettings } from "../shared/settings";
 import { createNoteFolderCreation } from "./vault/noteFolderCreationHost";
 import { SerialQueue } from "./serialQueue";
 import { LivePreviewSaveCoordinator } from "./livePreviewSaveCoordinator";
+import { createLivePreviewImagePublication } from "./livePreviewImageHost";
+import type { LivePreviewImagePublication } from "./livePreviewImagePublication";
 import type {
   HostMsg,
   WebviewMsg,
@@ -65,6 +67,7 @@ function toHostOffsets(document: vscode.TextDocument, offsets: number[]): number
 type PanelRecord = {
   document: vscode.TextDocument;
   panel: vscode.WebviewPanel;
+  imagePublication: LivePreviewImagePublication;
 };
 
 // ---------------------------------------------------------------------------
@@ -77,9 +80,8 @@ export class OfmCustomTextEditorProvider
   private readonly noteFolderCreation = createNoteFolderCreation();
 
   /**
-   * Registry of active webview panels, keyed by document URI string. Stores the
-   * document too so an image-index change can recompute the image map for every
-   * open editor (not just on text edits).
+   * Registry of active webview panels, keyed by document URI string. Each panel
+   * owns its image publication lifetime, including while hidden.
    */
   private panels: Map<string, Map<vscode.WebviewPanel, PanelRecord>> =
     new Map();
@@ -123,9 +125,6 @@ export class OfmCustomTextEditorProvider
     return panels && [...panels.keys()].filter(panel => this.readyPanels.has(panel));
   }
 
-  /** Last image-map JSON sent per panel, to avoid redundant webview re-renders. */
-  private lastImageMap: WeakMap<vscode.WebviewPanel, string> = new WeakMap();
-
   /** Panels that completed the webview ready/init handshake. */
   private readyPanels = new WeakSet<vscode.WebviewPanel>();
 
@@ -158,8 +157,8 @@ export class OfmCustomTextEditorProvider
     if (this.imageIndex) {
       this.context.subscriptions.push(
         this.imageIndex.onDidChange(() => {
-          for (const { document, panel } of this.allPanelRecords()) {
-            this.sendImageMap(document, panel);
+          for (const { imagePublication } of this.allPanelRecords()) {
+            imagePublication.refresh();
           }
         })
       );
@@ -250,8 +249,10 @@ export class OfmCustomTextEditorProvider
       panelsForUri = new Map();
       this.panels.set(uri, panelsForUri);
     }
-    panelsForUri.set(webviewPanel, { document, panel: webviewPanel });
+    const imagePublication = createLivePreviewImagePublication(document, webviewPanel.webview, this.imageIndex);
+    panelsForUri.set(webviewPanel, { document, panel: webviewPanel, imagePublication });
     webviewPanel.onDidDispose(() => {
+      imagePublication.dispose();
       this.saves.cancelPeer(webviewPanel);
       const records = this.panels.get(uri);
       records?.delete(webviewPanel);
@@ -259,9 +260,6 @@ export class OfmCustomTextEditorProvider
         this.panels.delete(uri);
         this.edits.lastPeerClosed(uri);
       }
-      // Drop the dedup cache so a REOPENED webview (which starts with an empty
-      // imageMap) is re-sent the map even if the document text is unchanged.
-      this.lastImageMap.delete(webviewPanel);
       this.readyPanels.delete(webviewPanel);
       if (records?.size === 0) this.pendingReveals.delete(uri);
     });
@@ -443,13 +441,7 @@ export class OfmCustomTextEditorProvider
       this.postReveal(panel, pendingReveal.line, pendingReveal.character);
     }
     this.imageIndex?.ensureFreshForDocument(document.uri, "webview-ready");
-    // FORCE the image map to this freshly-ready webview: a pre-ready send (e.g.
-    // an imageIndex.onDidChange that fired before `ready`) is dropped by the
-    // webview (view still null) yet updated lastImageMap, which would dedupe-skip
-    // this send and leave the ready webview with no images. Clearing the cache
-    // first guarantees delivery once the webview can actually apply it.
-    this.lastImageMap.delete(panel);
-    this.sendImageMap(document, panel);
+    this.panels.get(document.uri.toString())?.get(panel)?.imagePublication.ready();
   }
 
   private async openRecoveryCopy(uri: string): Promise<void> {
@@ -918,7 +910,7 @@ export class OfmCustomTextEditorProvider
   }
 
   // -----------------------------------------------------------------------
-  // Image resolution: map raw `![](src)` paths to webview-safe URIs
+  // Webview resource roots
   // -----------------------------------------------------------------------
 
   private resourceRoots(document: vscode.TextDocument): vscode.Uri[] {
@@ -932,60 +924,6 @@ export class OfmCustomTextEditorProvider
     return roots;
   }
 
-  private sendImageMap(
-    document: vscode.TextDocument,
-    panel: vscode.WebviewPanel
-  ): void {
-    const text = document.getText();
-    const dir = vscode.Uri.joinPath(document.uri, "..");
-    const map: Record<string, string> = {};
-
-    // Legacy resolution: relative to the document's folder (what we did before the
-    // vault-wide index). Used when the ImageIndex can't resolve (not ready /
-    // over-cap / outside a workspace root / genuinely unresolved) — no regression
-    // for same-folder images and existing relative paths.
-    const legacy = (src: string): string => {
-      const fileUri = src.startsWith("/")
-        ? vscode.Uri.file(src)
-        : vscode.Uri.joinPath(dir, src);
-      return panel.webview.asWebviewUri(fileUri).toString();
-    };
-
-    // `key` is what the WEBVIEW looks up (raw markdown src, or the embed target);
-    // `ref` is the path we hand the resolver. SYNCHRONOUS — no I/O here.
-    const put = (key: string, ref: string, requireImageExt: boolean): void => {
-      if (map[key] !== undefined) return;
-      if (/^(https?:|data:)/.test(ref)) {
-        map[key] = ref;
-        return;
-      }
-      const hit = this.imageIndex?.resolveImage(document.uri, ref, requireImageExt);
-      map[key] = hit ? panel.webview.asWebviewUri(hit).toString() : legacy(ref);
-    };
-
-    // Standard images: ![alt](src) — key === the raw src (matches the webview).
-    const re = /!\[[^\]]*\]\(\s*([^)\s]+)/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) put(m[1], m[1], false);
-
-    // Image embeds: ![[target#anchor|size]] — key === the webview's
-    // `inner.split("|")[0].split("#")[0].trim()`; only image-extension targets
-    // are images (note embeds render as chips, not here).
-    const embedRe = /!\[\[([^\]]+?)\]\]/g;
-    while ((m = embedRe.exec(text)) !== null) {
-      const target = m[1].split("|")[0].split("#")[0].trim();
-      if (/\.(png|jpe?g|gif|svg|webp|bmp|avif)$/i.test(target)) put(target, target, true);
-    }
-
-    // Stable serialization (sorted keys) so insertion-order churn never reposts;
-    // a changed resolved URI for the same key still reposts (index events).
-    const json = JSON.stringify(map, Object.keys(map).sort());
-    if (this.lastImageMap.get(panel) === json) return; // unchanged → skip
-    this.lastImageMap.set(panel, json);
-    const msg: HostMsg = { type: "imageMap", map };
-    panel.webview.postMessage(msg);
-  }
-
   // -----------------------------------------------------------------------
   // onDidChangeTextDocument → reconcile external changes into webview
   // -----------------------------------------------------------------------
@@ -995,9 +933,9 @@ export class OfmCustomTextEditorProvider
     const records = [...(this.panels.get(uri)?.values() ?? [])];
 
     // Refresh image resolution on every change (images can be typed/edited);
-    // sendImageMap only posts when the set of image srcs actually changed.
-    for (const { panel } of records) {
-      this.sendImageMap(e.document, panel);
+    // Publication suppresses equivalent complete maps independently per panel.
+    for (const { imagePublication } of records) {
+      imagePublication.refresh();
     }
 
     this.edits.observe(e.document, hostDocumentChanges(e));

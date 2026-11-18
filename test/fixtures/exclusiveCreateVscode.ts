@@ -2,11 +2,27 @@
 // The fs methods are replaced by the test; a successful stat is not proof the
 // name is a file.
 import { dirname, join } from "node:path";
+import type { TextDocumentChangeEvent } from "vscode";
+
+export class EventEmitter<T> {
+  private readonly listeners = new Set<(event: T) => unknown>();
+  readonly event = (listener: (event: T) => unknown) => {
+    this.listeners.add(listener);
+    return { dispose: () => { this.listeners.delete(listener); } };
+  };
+  fire(event: T): void {
+    for (const listener of this.listeners) listener(event);
+  }
+  dispose(): void { this.listeners.clear(); }
+}
+
+export const documentChanges = new EventEmitter<TextDocumentChangeEvent>();
 
 export class Uri {
   scheme: string;
   path: string;
   fsPath: string;
+  query = "";
   constructor(scheme: string, path: string, fsPath?: string) {
     this.scheme = scheme;
     this.path = path;
@@ -16,7 +32,12 @@ export class Uri {
     return new Uri("file", p, p);
   }
   toString(): string {
-    return `${this.scheme}:${this.path}`;
+    return `${this.scheme}:${this.path}${this.query ? `?${this.query}` : ""}`;
+  }
+  with(change: { query?: string }): Uri {
+    const uri = new Uri(this.scheme, this.path, this.fsPath);
+    uri.query = change.query ?? this.query;
+    return uri;
   }
   // The real Uri.joinPath uses the platform separator. A slash-only join
   // leaves `C:\notes\Current.md/Free note.md` on Windows, so the create
@@ -85,7 +106,7 @@ export const workspace = {
       throw new Error("delete");
     },
   },
-  onDidChangeTextDocument: () => ({ dispose() {} }),
+  onDidChangeTextDocument: documentChanges.event,
   onWillSaveTextDocument: () => ({ dispose() {} }),
   onDidSaveTextDocument: () => ({ dispose() {} }),
   onDidChangeConfiguration: () => ({ dispose() {} }),
