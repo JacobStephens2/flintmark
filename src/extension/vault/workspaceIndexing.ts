@@ -189,9 +189,9 @@ interface RuntimeState {
   capped?: boolean;
 }
 
-interface RefreshInvalidationBatch {
+interface PendingRefreshBatch<TUri extends WorkspaceIndexUri> {
   mode: WorkspaceIndexRefreshMode;
-  paths: Set<string>;
+  uris: Map<string, TUri>;
 }
 
 interface SpecRegistration<TUri extends WorkspaceIndexUri> {
@@ -227,13 +227,20 @@ function comparisonUriKey(uri: WorkspaceIndexUri): string {
     : uri.toString();
 }
 
-function containmentMatchLength(root: WorkspaceIndexUri, target: WorkspaceIndexUri): number | undefined {
+function containmentMatch(
+  root: WorkspaceIndexUri,
+  target: WorkspaceIndexUri
+): { rootLength: number; exact: boolean; baseLength: number } | undefined {
   if (root.scheme !== target.scheme) return undefined;
   const rootTrimmed = trimTrailingSlash(indexComparisonPath(root));
   const targetPath = indexComparisonPath(target);
-  if (targetPath === rootTrimmed) return rootTrimmed.length;
+  if (targetPath === rootTrimmed) {
+    return { rootLength: rootTrimmed.length, exact: true, baseLength: rootTrimmed.length };
+  }
   const base = rootTrimmed === "/" ? "/" : rootTrimmed + "/";
-  return targetPath.startsWith(base) ? rootTrimmed.length : undefined;
+  return targetPath.startsWith(base)
+    ? { rootLength: rootTrimmed.length, exact: false, baseLength: base.length }
+    : undefined;
 }
 
 /** Strip a folder's path prefix off a contained file Uri -> root-relative path.
@@ -242,13 +249,8 @@ export function relativePathFromRoot<TUri extends WorkspaceIndexUri>(
   root: TUri,
   file: TUri
 ): string {
-  if (root.scheme === file.scheme) {
-    const rootTrimmed = trimTrailingSlash(indexComparisonPath(root));
-    const filePath = indexComparisonPath(file);
-    if (filePath === rootTrimmed) return "";
-    const base = rootTrimmed === "/" ? "/" : rootTrimmed + "/";
-    if (filePath.startsWith(base)) return file.path.slice(base.length);
-  }
+  const match = containmentMatch(root, file);
+  if (match) return match.exact ? "" : file.path.slice(match.baseLength);
   return file.path.replace(/^\/+/, "");
 }
 
@@ -268,17 +270,27 @@ function directoriesHoldingFiles(
   return dirs;
 }
 
-function mergeRefreshInvalidation(
-  current: RefreshInvalidationBatch | undefined,
+function mergeRefreshInvalidation<TUri extends WorkspaceIndexUri>(
+  current: PendingRefreshBatch<TUri> | undefined,
   mode: WorkspaceIndexRefreshMode,
-  path?: string
-): RefreshInvalidationBatch {
+  changedUri?: TUri
+): PendingRefreshBatch<TUri> {
   if (current?.mode === "full" || mode === "full") {
-    return { mode: "full", paths: new Set() };
+    return { mode: "full", uris: new Map() };
   }
-  const paths = new Set(current?.paths);
-  if (path) paths.add(path);
-  return { mode: current?.mode === "paths" || mode === "paths" ? "paths" : "content", paths };
+  const uris = new Map(current?.uris);
+  if (changedUri) uris.set(comparisonUriKey(changedUri), changedUri);
+  return { mode: current?.mode === "paths" || mode === "paths" ? "paths" : "content", uris };
+}
+
+function subtreeIncludeGlob(include: string, relDir: string): string {
+  if (relDir === "" || /^\*\*\/[^/]+$/.test(include)) return include;
+  const prefixed = /^([^*?[\]{}()!]+)\/(\*\*\/[^/]+)$/.exec(include);
+  if (prefixed) {
+    const [, prefix, tail] = prefixed;
+    if (relDir === prefix || relDir.startsWith(prefix + "/")) return tail;
+  }
+  return "**/*";
 }
 
 class ExclusionPolicy {
@@ -391,8 +403,7 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
   private readonly roots = new Map<string, TUri>();
   private readonly timers = new Map<string, unknown>();
   private readonly fullRefreshTimers = new Map<string, unknown>();
-  private readonly pending = new Map<string, RefreshInvalidationBatch>();
-  private readonly pendingUris = new Map<string, Map<string, TUri>>();
+  private readonly pending = new Map<string, PendingRefreshBatch<TUri>>();
   private readonly generations = new GenerationClock();
   private readonly runtime = new Map<string, RuntimeState>();
   private readonly scanQueue = new ScanQueue();
@@ -563,7 +574,7 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
             this.trackScan(
               this.rescan(registration, root, "initial-scan", generation, {
                 mode: "full",
-                paths: new Set(),
+                uris: new Map(),
               })
             )
           );
@@ -681,35 +692,29 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
     this.exclusions.delete(scanKey);
     this.runtime.delete(scanKey);
     this.pending.delete(scanKey);
-    this.pendingUris.delete(scanKey);
   }
 
-  private resolveRoot(uri: TUri): TUri | undefined {
+  private longestContainingRoot(roots: Iterable<TUri>, uri: TUri): TUri | undefined {
     let bestRoot: TUri | undefined;
     let bestLength = -1;
-    for (const root of this.roots.values()) {
-      const length = containmentMatchLength(root, uri);
-      if (length !== undefined && length > bestLength) {
-        bestLength = length;
+    for (const root of roots) {
+      const match = containmentMatch(root, uri);
+      if (match && match.rootLength > bestLength) {
+        bestLength = match.rootLength;
         bestRoot = root;
       }
     }
     return bestRoot;
   }
 
+  private resolveRoot(uri: TUri): TUri | undefined {
+    return this.longestContainingRoot(this.roots.values(), uri);
+  }
+
   private resolveRootForEnsureFresh(uri: TUri): TUri | undefined {
     const existing = this.resolveRoot(uri);
     if (existing || this.initialized) return existing;
-    let bestRoot: TUri | undefined;
-    let bestLength = -1;
-    for (const folder of this.host.workspaceFolders()) {
-      const length = containmentMatchLength(folder, uri);
-      if (length !== undefined && length > bestLength) {
-        bestLength = length;
-        bestRoot = folder;
-      }
-    }
-    return bestRoot;
+    return this.longestContainingRoot(this.host.workspaceFolders(), uri);
   }
 
   private scheduleForUri(
@@ -719,9 +724,13 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
     mode: WorkspaceIndexRefreshMode = "paths"
   ): void {
     if (this.disposed) return;
+    const registration = this.specs.get(kind);
+    if (!registration || registration.disposed) return;
     const root = this.resolveRoot(uri);
     if (!root) return;
-    if (this.exclusionPolicy(kind, root).excludes(relativePathFromRoot(root, uri))) return;
+    const rel = relativePathFromRoot(root, uri);
+    if (this.exclusionPolicy(kind, root).excludes(rel)) return;
+    if (mode === "content" && !this.matchesSpec(registration, rel)) return;
     this.requestRefresh(kind, root, reason, false, true, mode, uri);
   }
 
@@ -766,19 +775,10 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
     }
 
     if (markDirty) state.dirtyEpoch++;
-    const uriKey = changedUri ? comparisonUriKey(changedUri) : undefined;
     this.pending.set(
       scanKey,
-      mergeRefreshInvalidation(this.pending.get(scanKey), mode, mode !== "full" ? uriKey : undefined)
+      mergeRefreshInvalidation(this.pending.get(scanKey), mode, mode !== "full" ? changedUri : undefined)
     );
-    const mergedMode = this.pending.get(scanKey)?.mode;
-    if (mode !== "full" && changedUri && uriKey && mergedMode !== "full") {
-      const uris = this.pendingUris.get(scanKey) ?? new Map<string, TUri>();
-      uris.set(uriKey, changedUri);
-      this.pendingUris.set(scanKey, uris);
-    } else if (mergedMode === "full") {
-      this.pendingUris.delete(scanKey);
-    }
 
     // Queue hints without cancelling an active scan, and keep the leading-edge
     // timer deadline so continuous traffic cannot starve publication.
@@ -796,12 +796,10 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
           this.checkSettled();
           return;
         }
-        const batch = this.pending.get(scanKey) ?? { mode: "full", paths: new Set<string>() };
-        const uris = this.pendingUris.get(scanKey);
+        const batch = this.pending.get(scanKey) ?? { mode: "full", uris: new Map<string, TUri>() };
         this.pending.delete(scanKey);
-        this.pendingUris.delete(scanKey);
         const generation = this.bumpGeneration(scanKey);
-        void this.trackScan(this.rescan(registration, root, reason, generation, batch, uris));
+        void this.trackScan(this.rescan(registration, root, reason, generation, batch));
       }, delay)
     );
   }
@@ -831,8 +829,7 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
     root: TUri,
     reason: string,
     generation: number,
-    batch: RefreshInvalidationBatch,
-    batchUris?: ReadonlyMap<string, TUri>
+    batch: PendingRefreshBatch<TUri>
   ): Promise<void> {
     const kind = registration.spec.kind;
     const rootKey = canonicalRootKey(root);
@@ -846,14 +843,30 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
 
     try {
       await this.scanQueue.run(scanKey, isCurrent, () =>
-        this.buildSnapshot(registration, root, reason, generation, batch, batchUris)
+        this.buildSnapshot(registration, root, reason, generation, batch)
       );
     } finally {
       if (isCurrent() && !stateIsBuilding(this.runtimeState(kind, rootKey)) && this.pending.has(scanKey)) {
         const pending = this.pending.get(scanKey)!;
+        // Clear full batches before rescheduling so cooldown deferral does not
+        // strand "full" in pending and swallow subsequent incremental updates.
+        if (pending.mode === "full") this.pending.delete(scanKey);
         this.requestRefresh(kind, root, "deferred-events", false, false, pending.mode);
       }
     }
+  }
+
+  private finishBuildState(
+    state: RuntimeState,
+    status: Exclude<IndexSnapshotStatus, "notReady" | "building">,
+    completedEpoch?: number,
+    lastSuccessAt?: number
+  ): void {
+    state.status = status;
+    if (completedEpoch !== undefined) state.completedEpoch = completedEpoch;
+    if (lastSuccessAt !== undefined) state.lastSuccessAt = lastSuccessAt;
+    state.inFlight = false;
+    state.inFlightGeneration = undefined;
   }
 
   private async buildSnapshot(
@@ -861,8 +874,7 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
     root: TUri,
     reason: string,
     myGen: number,
-    batch: RefreshInvalidationBatch,
-    batchUris?: ReadonlyMap<string, TUri>
+    batch: PendingRefreshBatch<TUri>
   ): Promise<void> {
     const spec = registration.spec;
     const kind = spec.kind;
@@ -904,28 +916,23 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
           root,
           scanKey,
           state,
-          batchUris,
+          batch.uris,
           context,
           cancellation.signal,
           isCurrent
         );
+        if (!isCurrent()) throw new WorkspaceIndexBuildCancelled();
         if (result === "no-op") {
-          state.status = "ready";
-          state.completedEpoch = startedEpoch;
-          state.inFlight = false;
-          state.inFlightGeneration = undefined;
+          this.finishBuildState(state, "ready", startedEpoch);
           return;
         }
         snapshot = result.snapshot;
         changedUris = result.changedUris;
         scannedFiles = result.scannedFiles;
       } else if (batch.mode === "content" && spec.patchSnapshot) {
-        changedUris = [...batch.paths].flatMap((key) => {
-          const uri = batchUris?.get(key);
-          return uri ? [uri] : [];
-        });
+        changedUris = [...batch.uris.values()];
         const current = this.snapshots.get(kind)?.get(rootKey);
-        if (current !== undefined && changedUris.length === batch.paths.size) {
+        if (current !== undefined && changedUris.length > 0) {
           snapshot = await spec.patchSnapshot(
             root,
             current,
@@ -944,9 +951,7 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
           this.nowFn() - state.lastFullScanAt < FULL_RESCAN_INTERVAL_MS
         ) {
           this.requestRefresh(kind, root, "patch-fallback", false, true);
-          state.status = "ready";
-          state.inFlight = false;
-          state.inFlightGeneration = undefined;
+          this.finishBuildState(state, "ready");
           return;
         }
         changedUris = [];
@@ -959,12 +964,12 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
           cap + 1,
           cancellation.signal
         );
+        if (!isCurrent()) throw new WorkspaceIndexBuildCancelled();
         const filtered = found.filter((file) => {
           const rel = relativePathFromRoot(root, file);
-          return !policy.excludes(rel) && (!spec.matchesPath || spec.matchesPath(rel));
+          return !policy.excludes(rel) && this.matchesSpec(registration, rel);
         });
-        if (!isCurrent()) throw new WorkspaceIndexBuildCancelled();
-        state.capped = filtered.length >= cap;
+        state.capped = filtered.length > cap;
         if (state.capped) {
           this.notifyLargeRoot(root, { kind: "cap-reached", root, maxFiles: cap });
         }
@@ -976,16 +981,12 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
     } catch (error) {
       if (!isCurrent() || error instanceof WorkspaceIndexBuildCancelled || cancellation.signal.aborted) {
         if (state.inFlightGeneration === myGen) {
-          state.status = "cancelled";
-          state.inFlight = false;
-          state.inFlightGeneration = undefined;
+          this.finishBuildState(state, "cancelled");
         }
         return;
       }
       if (state.inFlightGeneration === myGen) {
-        state.status = "failed";
-        state.inFlight = false;
-        state.inFlightGeneration = undefined;
+        this.finishBuildState(state, "failed");
       }
       this.host.onError?.(error, { kind, root, reason });
       return;
@@ -997,9 +998,7 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
 
     if (!isCurrent()) {
       if (state.inFlightGeneration === myGen) {
-        state.status = "cancelled";
-        state.inFlight = false;
-        state.inFlightGeneration = undefined;
+        this.finishBuildState(state, "cancelled");
       }
       return;
     }
@@ -1017,11 +1016,7 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
         directoriesHoldingFiles(scannedFiles.map(indexComparisonPath), indexComparisonPath(root))
       );
     }
-    state.status = "ready";
-    state.lastSuccessAt = this.nowFn();
-    state.completedEpoch = startedEpoch;
-    state.inFlight = false;
-    state.inFlightGeneration = undefined;
+    this.finishBuildState(state, "ready", startedEpoch, this.nowFn());
 
     const event: WorkspaceIndexRefreshEvent<TUri> = {
       kind,
@@ -1039,7 +1034,7 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
     root: TUri,
     scanKey: string,
     state: RuntimeState,
-    batchUris: ReadonlyMap<string, TUri> | undefined,
+    batchUris: ReadonlyMap<string, TUri>,
     context: WorkspaceIndexBuildContext<TUri>,
     signal: AbortSignal,
     isCurrent: () => boolean
@@ -1061,7 +1056,7 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
     const policy = this.exclusionPolicy(kind, root);
 
     const changes = await mapInCooperativeBatches(
-      [...(batchUris?.values() ?? [])],
+      [...batchUris.values()],
       READ_BATCH_SIZE,
       async (uri): Promise<{ uri: TUri; found?: readonly TUri[] }> => {
         const statType = await this.host.stat(uri);
@@ -1112,11 +1107,21 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
         }
       }
 
-      const found =
-        directFiles ??
-        (
-          await this.host.findFiles(uri, spec.include, policy.glob, cap + 1, signal)
-        ).filter((file) => !spec.matchesPath || spec.matchesPath(relativePathFromRoot(root, file)));
+      let found = directFiles;
+      if (!found) {
+        const includePattern = subtreeIncludeGlob(spec.include, relativePathFromRoot(root, uri));
+        const discovered = await this.host.findFiles(
+          uri,
+          includePattern,
+          policy.glob,
+          cap + 1,
+          signal
+        );
+        if (!isCurrent()) throw new WorkspaceIndexBuildCancelled();
+        found = discovered.filter((file) =>
+          this.matchesSpec(registration, relativePathFromRoot(root, file))
+        );
+      }
 
       for (const file of found) {
         const rel = relativePathFromRoot(root, file);
@@ -1150,9 +1155,11 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
         },
         context
       );
+      if (!isCurrent()) throw new WorkspaceIndexBuildCancelled();
     }
     if (snapshot === undefined) {
       snapshot = await spec.build(root, toIndexFiles(root, files.values()), context);
+      if (!isCurrent()) throw new WorkspaceIndexBuildCancelled();
     }
     return { snapshot, changedUris, scannedFiles: [...files.values()] };
   }
@@ -1353,7 +1360,6 @@ export class WorkspaceIndex<TUri extends WorkspaceIndexUri> implements Workspace
     this.timers.clear();
     this.fullRefreshTimers.clear();
     this.pending.clear();
-    this.pendingUris.clear();
     this.workspaceWatcher?.dispose();
     this.workspaceWatcher = undefined;
     for (const registration of this.specs.values()) {

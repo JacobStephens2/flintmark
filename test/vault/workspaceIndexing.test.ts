@@ -715,8 +715,6 @@ async function main(): Promise<void> {
     });
 
     const index = new WorkspaceIndex(mem.host());
-    const noteEvents: WorkspaceIndexRefreshEvent<TestUri>[] = [];
-    const imageEvents: WorkspaceIndexRefreshEvent<TestUri>[] = [];
     const note = index.register({
       kind: "note",
       include: "**/*.md",
@@ -740,8 +738,6 @@ async function main(): Promise<void> {
         return [...set].sort();
       },
     });
-    note.onDidRefresh((e) => noteEvents.push(e));
-    image.onDidRefresh((e) => imageEvents.push(e));
 
     await index.initialize();
     const initialFinds = mem.findFilesCalls.length;
@@ -1093,6 +1089,180 @@ async function main(): Promise<void> {
       assert.equal(mem.findFilesCalls.length, beforeFinds, `${c.name}: deletion needs no findFiles`);
       assert.equal(handle.snapshot(root)?.length, c.affected ? 0 : 1, c.name);
       assert.equal(handle.version(root), c.affected ? beforeVer + 1 : beforeVer, c.name);
+      index.dispose();
+    }
+  });
+
+  await test("regression guards: subtree globs, watchSpec matchesPath filtering, cancellation after subtree findFiles, unstranded cooldowns, and exact maxFiles fit", async () => {
+    // 1. Subtree findFiles preserves root-relative spec.include & matchesPath, and watchSpec changed ignores matchesPath misses.
+    {
+      const root = fileUri("/work");
+      const mem = new MemoryHost([root]);
+      mem.addFile(fileUri("/work/docs/a.md"), "a");
+      mem.addFile(fileUri("/work/docs/draft.md"), "draft");
+      mem.addFile(fileUri("/work/root.md"), "r");
+      const index = new WorkspaceIndex(mem.host());
+      let docsBuilds = 0;
+      let patchCalls = 0;
+      const docs = index.register({
+        kind: "docs",
+        include: "docs/**/*.md",
+        matchesPath: (rel) => !rel.endsWith("draft.md"),
+        watchContent: true,
+        debounceMs: 10,
+        notReady: () => [] as string[],
+        build: async (_r, files) => {
+          docsBuilds++;
+          return files.map((f) => f.relativePath).sort();
+        },
+        patchSnapshot: async (_r, snap, patch) => {
+          patchCalls++;
+          if (patch.mode === "content") {
+            for (const f of patch.changed) if (!snap.includes(f.relativePath)) return undefined;
+            return [...snap];
+          }
+          const next = new Set(snap);
+          for (const d of patch.deleted) next.delete(d.relativePath);
+          for (const c of patch.changed) next.add(c.relativePath);
+          return [...next].sort();
+        },
+      });
+      const rootOnly = index.register({
+        kind: "root-only",
+        include: "*.md",
+        debounceMs: 10,
+        notReady: () => [] as string[],
+        build: async (_r, files) => files.map((f) => f.relativePath).sort(),
+      });
+      await index.initialize();
+      assert.deepEqual(docs.snapshot(root), ["docs/a.md"]);
+      assert.deepEqual(rootOnly.snapshot(root), ["root.md"]);
+
+      mem.addDir(fileUri("/work/docs/nested"));
+      mem.addDir(fileUri("/work/docs/nested/sub"));
+      mem.addFile(fileUri("/work/docs/nested/sub/guide.md"), "g");
+      mem.workspaceSink!.treeCreated(fileUri("/work/docs/nested"));
+      mem.addDir(fileUri("/work/nested"));
+      mem.addDir(fileUri("/work/nested/sub"));
+      mem.addFile(fileUri("/work/nested/leak.md"), "l");
+      mem.workspaceSink!.treeCreated(fileUri("/work/nested"));
+      await mem.advanceBy(10);
+      await index.whenSettled();
+      assert.deepEqual(docs.snapshot(root), ["docs/a.md", "docs/nested/sub/guide.md"]);
+      assert.deepEqual(rootOnly.snapshot(root), ["root.md"]);
+
+      const verBefore = docs.version(root);
+      await mem.advanceBy(30_000);
+      mem.watchedSpecs.get("docs")!.sink.changed(fileUri("/work/docs/draft.md"));
+      await mem.advanceBy(10);
+      await index.whenSettled();
+      assert.equal(patchCalls, 1, "changed draft.md must not enter content patchSnapshot");
+      assert.equal(docsBuilds, 1, "changed draft.md must not trigger full rebuild");
+      assert.equal(docs.version(root), verBefore);
+      index.dispose();
+    }
+
+    // 2. Aborting subtree findFiles during reconcilePaths does not treat cancellation as no-op or invoke stale build.
+    {
+      const root = fileUri("/work");
+      let wsSink!: WorkspaceIndexWorkspaceSink<TestUri>;
+      let releaseFind!: () => void;
+      let enteredFind!: () => void;
+      const findGate = new Promise<void>((r) => { releaseFind = r; });
+      const findEntered = new Promise<void>((r) => { enteredFind = r; });
+      let phase: "init" | "reconcile" = "init";
+      let buildCalls = 0;
+      const index = new WorkspaceIndex({
+        workspaceFolders: () => [root],
+        stat: async (uri) => (uri.path === "/work/dir" ? "directory" : "missing"),
+        readDirectory: async () => [{ name: "sub", uri: fileUri("/work/dir/sub"), type: "directory" }],
+        findFiles: async (_b, _i, _e, _m, signal) => {
+          if (phase === "init") return [fileUri("/work/dir/sub/old.md")];
+          enteredFind();
+          await findGate;
+          // Resolve [] on cancel just like VS Code workspace.findFiles.
+          return signal.aborted ? [] : [fileUri("/work/dir/sub/old.md")];
+        },
+        readFile: async () => new Uint8Array(),
+        watchWorkspace: (s) => { wsSink = s; return { dispose() {} }; },
+      });
+      const handle = index.register({
+        kind: "note",
+        include: "**/*.md",
+        debounceMs: 1,
+        notReady: () => [] as string[],
+        build: async (_r, files) => {
+          buildCalls++;
+          return files.map((f) => f.relativePath);
+        },
+      });
+      await index.initialize();
+      phase = "reconcile";
+      wsSink.treeCreated(fileUri("/work/dir"));
+      await findEntered;
+      handle.dispose();
+      releaseFind();
+      await index.whenSettled();
+      assert.equal(buildCalls, 1);
+      index.dispose();
+    }
+
+    // 3. Forced full refresh arriving mid-flight after cooldown does not strand "full" in pending.
+    {
+      const root = fileUri("/work");
+      const mem = new MemoryHost([root]);
+      mem.addFile(fileUri("/work/a.md"), "a");
+      const index = new WorkspaceIndex(mem.host());
+      const handle = index.register({
+        kind: "note",
+        include: "**/*.md",
+        debounceMs: 10,
+        notReady: () => [] as string[],
+        build: async (_r, files) => files.map((f) => f.relativePath).sort(),
+      });
+      await index.initialize();
+      await mem.advanceBy(30_000);
+      const hold = mem.holdFindFiles();
+      handle.requestRefresh(root, "held", true);
+      await mem.advanceBy(0);
+      await hold.entered;
+      handle.ensureFresh(fileUri("/work/a.md"), "forced", { force: true });
+      hold.release();
+      await index.whenSettled();
+      mem.addFile(fileUri("/work/new-during-cooldown.md"), "new");
+      mem.watchedSpecs.get("note")!.sink.created(fileUri("/work/new-during-cooldown.md"));
+      await mem.advanceBy(10);
+      await index.whenSettled();
+      assert.deepEqual(handle.snapshot(root), ["a.md", "new-during-cooldown.md"]);
+      const findsBeforeCooldown = mem.findFilesCalls.length;
+      await mem.advanceBy(30_000);
+      await index.whenSettled();
+      assert.equal(mem.findFilesCalls.length, findsBeforeCooldown + 1);
+      index.dispose();
+    }
+
+    // 4. Exact maxFiles fit (count === cap) does not trigger cap-reached notice or suppress ensureFresh.
+    {
+      const root = fileUri("/work");
+      const mem = new MemoryHost([root]);
+      mem.addFile(fileUri("/work/1.md"), "1");
+      mem.addFile(fileUri("/work/2.md"), "2");
+      const index = new WorkspaceIndex(mem.host());
+      const handle = index.register({
+        kind: "note",
+        include: "**/*.md",
+        maxFiles: () => 2,
+        notReady: () => [] as string[],
+        build: async (_r, files) => files.map((f) => f.relativePath).sort(),
+      });
+      await index.initialize();
+      assert.deepEqual(mem.notices, []);
+      assert.deepEqual(handle.snapshot(root), ["1.md", "2.md"]);
+      await mem.advanceBy(30_000);
+      handle.ensureFresh(fileUri("/work/1.md"), "attachment-saved", { force: true });
+      await mem.advanceBy(100);
+      await index.whenSettled();
+      assert.equal(mem.findFilesCalls.length, 2);
       index.dispose();
     }
   });
