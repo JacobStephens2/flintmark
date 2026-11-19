@@ -1,7 +1,6 @@
-import { readIndexFile } from "./readIndexFile";
 // Vault Index · thin VS Code adapter (MAY import vscode).
 //
-// Publication ordering and queries live in vaultPublication.ts; the driver
+// Publication ordering and queries live in vaultPublication.ts; WorkspaceIndex
 // owns scanning and watching. This adapter reads/patches root note snapshots
 // and converts VS Code query arguments to opaque URI strings.
 // Typical use:
@@ -17,13 +16,16 @@ import type { VaultData } from "../../shared/protocol";
 import { waitForVaultBuildGate } from "./vaultBuildGate";
 import { mapInCooperativeBatches } from "./cooperativeBatches";
 import { patchNoteSnapshot, type NoteSnapshot } from "./vaultSnapshot";
-import type { WorkspaceIndexPatch } from "./workspaceIndexPolicy";
 import {
-  WorkspaceIndexDriver,
+  WorkspaceIndex,
   WorkspaceIndexBuildCancelled,
   type WorkspaceIndexBuildContext,
+  type WorkspaceIndexDisposable,
+  type WorkspaceIndexFile,
   type WorkspaceIndexHandle,
-} from "./workspaceIndexDriver";
+  type WorkspaceIndexPatch,
+} from "./workspaceIndexing";
+import { createVscodeWorkspaceIndex } from "./workspaceIndexHost";
 
 const MD_GLOB = "**/*.{md,markdown}";
 const REBUILD_DEBOUNCE_MS = 50;
@@ -36,11 +38,11 @@ function emptyRootSnapshot(): VaultRootSnapshot {
 }
 
 export class VaultIndexService implements vscode.Disposable {
-  private readonly driver: WorkspaceIndexDriver;
-  private readonly ownsDriver: boolean;
-  private readonly handle: WorkspaceIndexHandle<VaultRootSnapshot>;
+  private readonly index: WorkspaceIndex<vscode.Uri>;
+  private readonly ownsIndex: boolean;
+  private readonly handle: WorkspaceIndexHandle<VaultRootSnapshot, vscode.Uri>;
   private readonly publication: VaultPublication<vscode.Uri>;
-  private readonly refreshSub: vscode.Disposable;
+  private readonly refreshSub: WorkspaceIndexDisposable;
   private readonly decoder = new TextDecoder();
 
   /** Fires after every publication so views can refresh (e.g. push
@@ -48,16 +50,15 @@ export class VaultIndexService implements vscode.Disposable {
   private readonly _onDidChange = new vscode.EventEmitter<void>();
   readonly onDidChange = this._onDidChange.event;
 
-  constructor(driver?: WorkspaceIndexDriver) {
-    this.driver = driver ?? new WorkspaceIndexDriver();
-    this.ownsDriver = driver === undefined;
-    this.handle = this.driver.registerSpec<VaultRootSnapshot>({
+  constructor(index?: WorkspaceIndex<vscode.Uri>) {
+    this.index = index ?? createVscodeWorkspaceIndex();
+    this.ownsIndex = index === undefined;
+    this.handle = this.index.register<VaultRootSnapshot>({
       kind: "note",
       include: MD_GLOB,
       debounceMs: REBUILD_DEBOUNCE_MS,
       watchContent: true,
       notReady: emptyRootSnapshot,
-      disabled: emptyRootSnapshot,
       build: (root, files, context) => this.buildSnapshot(root, files, context),
       patchSnapshot: (_root, snapshot, patch, context) =>
         this.patchSnapshot(snapshot, patch, context),
@@ -70,8 +71,7 @@ export class VaultIndexService implements vscode.Disposable {
       onDidChange: () => this._onDidChange.fire(),
       onError: (error) => console.error("[ofm] vault index rebuild failed", error),
     });
-    this.refreshSub = this.driver.onDidRefresh((event) => {
-      if (event.kind !== "note") return;
+    this.refreshSub = this.handle.onDidRefresh((event) => {
       if (event.mode === "content") {
         this.publication.refreshContent(event.root, event.changedUris.map((uri) => uri.toString()));
       } else this.publication.requestRebuild();
@@ -80,7 +80,7 @@ export class VaultIndexService implements vscode.Disposable {
 
   /** Scan the workspace and start watching. Safe to await once at activation. */
   async initialize(): Promise<void> {
-    await this.driver.initialize();
+    await this.index.initialize();
     await this.publication.waitForCurrentBuild();
   }
 
@@ -122,8 +122,8 @@ export class VaultIndexService implements vscode.Disposable {
 
   private async buildSnapshot(
     _root: vscode.Uri,
-    files: readonly vscode.Uri[],
-    context: WorkspaceIndexBuildContext
+    files: readonly WorkspaceIndexFile<vscode.Uri>[],
+    context: WorkspaceIndexBuildContext<vscode.Uri>
   ): Promise<VaultRootSnapshot> {
     await waitForVaultBuildGate(process.env.FLINTMARK_TEST_VAULT_BUILD_GATE);
     if (!context.isCurrent()) throw new WorkspaceIndexBuildCancelled();
@@ -132,9 +132,9 @@ export class VaultIndexService implements vscode.Disposable {
     const results = await mapInCooperativeBatches(
       files,
       READ_CONCURRENCY,
-      async (uri): Promise<{ input: NoteInput; uri: vscode.Uri } | undefined> => {
+      async ({ uri }): Promise<{ input: NoteInput; uri: vscode.Uri } | undefined> => {
         try {
-          const bytes = await readIndexFile(uri, (target) => vscode.workspace.fs.readFile(target));
+          const bytes = await context.readFile(uri);
           const key = uri.toString();
           return { input: { path: key, text: this.decoder.decode(bytes) }, uri };
         } catch {
@@ -162,13 +162,13 @@ export class VaultIndexService implements vscode.Disposable {
   private async patchSnapshot(
     snapshot: VaultRootSnapshot,
     patch: WorkspaceIndexPatch<vscode.Uri>,
-    context: WorkspaceIndexBuildContext
+    context: WorkspaceIndexBuildContext<vscode.Uri>
   ): Promise<VaultRootSnapshot | undefined> {
     return patchNoteSnapshot(
       snapshot,
       patch,
       (uri) => uri.toString(),
-      async (uri) => this.decoder.decode(await readIndexFile(uri, (target) => vscode.workspace.fs.readFile(target))),
+      async (uri) => this.decoder.decode(await context.readFile(uri)),
       () => {
         if (!context.isCurrent()) throw new WorkspaceIndexBuildCancelled();
       }
@@ -178,7 +178,8 @@ export class VaultIndexService implements vscode.Disposable {
   dispose(): void {
     this.publication.dispose();
     this.refreshSub.dispose();
+    this.handle.dispose();
     this._onDidChange.dispose();
-    if (this.ownsDriver) this.driver.dispose();
+    if (this.ownsIndex) this.index.dispose();
   }
 }

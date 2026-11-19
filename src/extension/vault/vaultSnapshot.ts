@@ -1,5 +1,5 @@
 import type { NoteInput } from "./vaultIndex";
-import type { WorkspaceIndexPatch } from "./workspaceIndexPolicy";
+import type { WorkspaceIndexPatch } from "./workspaceIndexing";
 
 export interface NoteSnapshot<TUri> {
   inputs: Map<string, NoteInput>;
@@ -17,17 +17,17 @@ export async function patchNoteSnapshot<TUri>(
 ): Promise<NoteSnapshot<TUri> | undefined> {
   const inputs = new Map(snapshot.inputs);
   const uris = new Map(snapshot.uris);
-  for (const uri of patch.mode === "paths" ? patch.deletedUris : []) {
-    inputs.delete(keyOf(uri));
-    uris.delete(keyOf(uri));
+  for (const file of patch.mode === "paths" ? patch.deleted : []) {
+    inputs.delete(keyOf(file.uri));
+    uris.delete(keyOf(file.uri));
   }
-  for (const uri of patch.changedUris) {
+  for (const file of patch.changed) {
     assertCurrent();
-    const key = keyOf(uri);
+    const key = keyOf(file.uri);
     if (patch.mode === "content" && !inputs.has(key)) return undefined;
     let text: string;
     try {
-      text = await readText(uri);
+      text = await readText(file.uri);
     } catch {
       if (patch.mode === "paths") {
         // Match full builds: a vanished or unreadable file is omitted. A later
@@ -40,7 +40,7 @@ export async function patchNoteSnapshot<TUri>(
     }
     assertCurrent();
     inputs.set(key, { path: key, text });
-    uris.set(key, uri);
+    uris.set(key, file.uri);
   }
   return { inputs, uris };
 }

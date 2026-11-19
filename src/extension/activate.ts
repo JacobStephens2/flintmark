@@ -8,11 +8,11 @@ import { registerBacklinks } from "./backlinksView";
 import { registerViewToggle } from "./viewToggle";
 import { VaultIndexService } from "./vault";
 import { ImageIndexService } from "./vault/imageIndexService";
-import { WorkspaceIndexDriver } from "./vault/workspaceIndexDriver";
+import { createVscodeWorkspaceIndex } from "./vault/workspaceIndexHost";
 import { DocumentStructureService } from "./documentStructureService";
 
 export function activate(context: vscode.ExtensionContext): void {
-  const workspaceIndexes = new WorkspaceIndexDriver();
+  const workspaceIndexes = createVscodeWorkspaceIndex();
   const documentStructures = new DocumentStructureService();
   context.subscriptions.push(documentStructures);
 
