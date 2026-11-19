@@ -57,3 +57,13 @@ lookup, and autocomplete data.
 The [Vault index publication module](src/extension/vault/vaultPublication.ts)
 owns publication ordering and the queries it protects behind a host-independent
 interface.
+
+## Workspace indexing
+
+The multi-root, multi-spec process that turns host searches, watcher
+invalidations, exclusions, and freshness checks into serialized, incremental
+per-root snapshots and refresh notifications.
+
+The [Workspace indexing module](src/extension/vault/workspaceIndexing.ts) owns
+multi-root tracking, spec routing, exclusions, scheduling, reconciliation, and
+path-normalization rules behind a host-independent interface.

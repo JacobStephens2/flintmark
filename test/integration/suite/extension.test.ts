@@ -1,4 +1,5 @@
-import { relFromRoot, WorkspaceIndexDriver } from "../../../src/extension/vault/workspaceIndexDriver";
+import { relativePathFromRoot } from "../../../src/extension/vault/workspaceIndexing";
+import { createVscodeWorkspaceIndex } from "../../../src/extension/vault/workspaceIndexHost";
 // L2 integration tests: exercise the host/wiring layer that unit tests can't
 // reach (it needs a real VS Code) and that the L3 webview e2e doesn't cover —
 // command registration/activation integrity, the view-switching + set-default
@@ -157,7 +158,7 @@ describe("Workspace index scan scheduling", () => {
     const folder = fs.mkdtempSync(path.join(os.tmpdir(), "ofm-index-"));
     fs.writeFileSync(path.join(folder, "note.md"), "# Indexed");
     const root = vscode.Uri.file(folder);
-    const driver = new WorkspaceIndexDriver();
+    const index = createVscodeWorkspaceIndex();
     let release!: () => void;
     let entered!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -165,21 +166,21 @@ describe("Workspace index scan scheduling", () => {
     let calls = 0;
     let active = 0;
     let maximum = 0;
-    const handle = driver.registerSpec({
+    const handle = index.register({
       kind: "note", include: "**/*.md", notReady: () => [] as string[],
       build: async (_root, files, context) => {
         calls++; active++; maximum = Math.max(maximum, active);
         const current = calls;
         try {
           if (current === 1) { entered(); await gate; }
-          return context.isCurrent() ? files.map((file) => file.toString()) : ["stale"];
+          return context.isCurrent() ? files.map((file) => file.uri.toString()) : ["stale"];
         } finally { active--; }
       },
     });
-    const firstPublished = new Promise<void>((resolve) => driver.onDidRefresh((event) => {
+    const firstPublished = new Promise<void>((resolve) => handle.onDidRefresh((event) => {
       if (event.version === 1) resolve();
     }));
-    const done = new Promise<void>((resolve) => driver.onDidRefresh((event) => {
+    const done = new Promise<void>((resolve) => handle.onDidRefresh((event) => {
       if (event.version === 2) resolve();
     }));
     try {
@@ -202,7 +203,7 @@ describe("Workspace index scan scheduling", () => {
         vscode.Uri.file(path.join(folder, name)).toString()).sort());
     } finally {
       release();
-      driver.dispose();
+      index.dispose();
       fs.rmSync(folder, { recursive: true, force: true });
     }
   });
@@ -217,7 +218,7 @@ describe("Workspace image paths", () => {
       for (const fileDrive of ["C", "c"]) {
         for (const trailingSlash of ["", "/"]) {
           assert.strictEqual(
-            relFromRoot(file("/" + rootDrive + ":/Notes" + trailingSlash), file("/" + fileDrive + ":/Notes/assets/Photo.PNG")),
+            relativePathFromRoot(file("/" + rootDrive + ":/Notes" + trailingSlash), file("/" + fileDrive + ":/Notes/assets/Photo.PNG")),
             "assets/Photo.PNG"
           );
         }
@@ -227,31 +228,31 @@ describe("Workspace image paths", () => {
 
   it("preserves spaces, Unicode, and filename case in image references", () => {
     assert.strictEqual(
-      relFromRoot(file("/C:/My Notes"), file("/c:/My Notes/assets/画像 Photo.SVG")),
+      relativePathFromRoot(file("/C:/My Notes"), file("/c:/My Notes/assets/画像 Photo.SVG")),
       "assets/画像 Photo.SVG"
     );
   });
 
   it("handles a Windows drive root", () => {
-    assert.strictEqual(relFromRoot(file("/D:/"), file("/d:/Photo.png")), "Photo.png");
+    assert.strictEqual(relativePathFromRoot(file("/D:/"), file("/d:/Photo.png")), "Photo.png");
   });
 
   it("does not confuse a neighboring folder or a different drive with the root", () => {
-    assert.strictEqual(relFromRoot(file("/C:/Notes"), file("/c:/Notes-archive/photo.png")), "c:/Notes-archive/photo.png");
-    assert.strictEqual(relFromRoot(file("/C:/Notes"), file("/d:/Notes/photo.png")), "d:/Notes/photo.png");
+    assert.strictEqual(relativePathFromRoot(file("/C:/Notes"), file("/c:/Notes-archive/photo.png")), "c:/Notes-archive/photo.png");
+    assert.strictEqual(relativePathFromRoot(file("/C:/Notes"), file("/d:/Notes/photo.png")), "d:/Notes/photo.png");
   });
 
   it("preserves case-sensitive directory boundaries and POSIX roots", () => {
-    assert.strictEqual(relFromRoot(file("/vault"), file("/vault/Photo.PNG")), "Photo.PNG");
-    assert.strictEqual(relFromRoot(file("/vault"), file("/Vault/Photo.PNG")), "Vault/Photo.PNG");
-    assert.strictEqual(relFromRoot(file("/"), file("/vault/Photo.PNG")), "vault/Photo.PNG");
-    assert.strictEqual(relFromRoot(file("/C:/Notes"), file("/c:/notes/Photo.PNG")), "c:/notes/Photo.PNG");
+    assert.strictEqual(relativePathFromRoot(file("/vault"), file("/vault/Photo.PNG")), "Photo.PNG");
+    assert.strictEqual(relativePathFromRoot(file("/vault"), file("/Vault/Photo.PNG")), "Vault/Photo.PNG");
+    assert.strictEqual(relativePathFromRoot(file("/"), file("/vault/Photo.PNG")), "vault/Photo.PNG");
+    assert.strictEqual(relativePathFromRoot(file("/C:/Notes"), file("/c:/notes/Photo.PNG")), "c:/notes/Photo.PNG");
   });
 
   it("does not rewrite drive-like paths belonging to non-file providers", () => {
     const root = vscode.Uri.from({ scheme: "custom", path: "/C:/Notes" });
     const image = vscode.Uri.from({ scheme: "custom", path: "/c:/Notes/photo.png" });
-    assert.strictEqual(relFromRoot(root, image), "c:/Notes/photo.png");
+    assert.strictEqual(relativePathFromRoot(root, image), "c:/Notes/photo.png");
   });
 });
 

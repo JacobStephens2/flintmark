@@ -48,7 +48,7 @@ import * as vscode from 'vscode';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import { counts } from './stats';
-import { WorkspaceIndexDriver } from ${JSON.stringify(resolve("src/extension/vault/workspaceIndexDriver.ts"))};
+import { createVscodeWorkspaceIndex } from ${JSON.stringify(resolve("src/extension/vault/workspaceIndexHost.ts"))};
 import { VaultIndexService } from ${JSON.stringify(resolve("src/extension/vault/vaultIndexService.ts"))};
 import { ImageIndexService } from ${JSON.stringify(resolve("src/extension/vault/imageIndexService.ts"))};
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -73,15 +73,12 @@ async function run() {
     return;
   }
   writeFileSync(${JSON.stringify(watcherReady)}, 'ready');
-  const driver = new WorkspaceIndexDriver();
-  const vault = new VaultIndexService(driver);
-  const image = new ImageIndexService(driver);
+  const workspaceIndex = createVscodeWorkspaceIndex();
+  const vault = new VaultIndexService(workspaceIndex);
+  const image = new ImageIndexService(workspaceIndex);
   const publications = { note: 0, image: 0 };
-  const liveSeen = { note: false, image: false };
-  driver.onDidRefresh(event => {
-    publications[event.kind]++;
-    if (event.changedUris.some(uri => /Live Target.md$|live.png$/.test(uri.path))) liveSeen[event.kind] = true;
-  });
+  vault.onDidChange(() => { publications.note++; });
+  image.onDidChange(() => { publications.image++; });
   try {
     await Promise.all([vault.initialize(), image.initialize()]);
     assert.ok(vault.resolveLink('Note-0'), 'first note graph is usable during noise');
@@ -89,7 +86,7 @@ async function run() {
     assert.ok(image.resolveImage(document, 'image-0.png', true), 'first image snapshot is usable');
     const note = vscode.Uri.file(${JSON.stringify(join(root, "Live Target.md"))});
     const picture = vscode.Uri.file(${JSON.stringify(join(root, "live.png"))});
-    const diagnostics = () => JSON.stringify({ ...counts, publications, liveSeen,
+    const diagnostics = () => JSON.stringify({ ...counts, publications,
       note: !!vault.resolveLink('Live Target'), image: !!image.resolveImage(document, 'live.png', true),
       notes: vault.getAllNotes().length });
     await vscode.workspace.fs.writeFile(note, Buffer.from('# Live Target'));
@@ -104,7 +101,7 @@ async function run() {
     writeFileSync(${JSON.stringify(result)}, JSON.stringify({ ok: true, ...counts }));
   } catch (error) {
     writeFileSync(${JSON.stringify(result)}, JSON.stringify({ ok: false, error: String(error.stack), ...counts }));
-  } finally { vault.dispose(); image.dispose(); driver.dispose(); }
+  } finally { vault.dispose(); image.dispose(); workspaceIndex.dispose(); }
 }
 `);
 await build({

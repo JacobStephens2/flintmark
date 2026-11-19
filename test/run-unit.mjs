@@ -16,12 +16,6 @@ function vscodeAliasFor(file) {
   if (resolved === resolve("test/ai/aiLog.test.ts")) {
     return { vscode: resolve("test/fixtures/aiLogVscode.ts") };
   }
-  if (resolved === resolve("test/vault/workspaceIndexDriver.test.ts")) {
-    return {
-      vscode: resolve("test/fixtures/workspaceIndexVscode.ts"),
-      "node:fs/promises": resolve("test/fixtures/workspaceIndexFs.ts"),
-    };
-  }
   if (resolved === resolve("test/vault/exclusiveCreateHost.test.ts") ||
       resolved === resolve("test/vault/noteFolderCreationHost.test.ts") ||
       resolved === resolve("test/vault/livePreviewImagePublicationHost.test.ts")) {

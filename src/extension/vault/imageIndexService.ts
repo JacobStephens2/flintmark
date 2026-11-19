@@ -9,53 +9,52 @@
 // document-relative resolution (no regression for same-folder images).
 
 import * as vscode from "vscode";
-import { ImageSnapshot } from "./imageResolver";
+import { hasImageExtension, ImageSnapshot } from "./imageResolver";
 import {
-  relFromRoot,
-  WorkspaceIndexDriver,
+  DEFAULT_MAX_FILES,
+  WorkspaceIndex,
+  type WorkspaceIndexDisposable,
   type WorkspaceIndexHandle,
-} from "./workspaceIndexDriver";
-import { DEFAULT_MAX_FILES } from "./workspaceIndexPolicy";
+} from "./workspaceIndexing";
+import { createVscodeWorkspaceIndex } from "./workspaceIndexHost";
 
 const IMAGE_GLOB = "**/*.{png,jpg,jpeg,gif,svg,webp,bmp,avif}";
 const RESCAN_DEBOUNCE_MS = 150;
 
 export class ImageIndexService implements vscode.Disposable {
-  private readonly driver: WorkspaceIndexDriver;
-  private readonly ownsDriver: boolean;
-  private readonly handle: WorkspaceIndexHandle<ImageSnapshot>;
+  private readonly index: WorkspaceIndex<vscode.Uri>;
+  private readonly ownsIndex: boolean;
+  private readonly handle: WorkspaceIndexHandle<ImageSnapshot, vscode.Uri>;
   private readonly emitter = new vscode.EventEmitter<void>();
-  private readonly refreshSub: vscode.Disposable;
+  private readonly refreshSub: WorkspaceIndexDisposable;
 
   /** Fires after any root's snapshot is (re)built. */
   readonly onDidChange = this.emitter.event;
 
-  constructor(driver?: WorkspaceIndexDriver) {
-    this.driver = driver ?? new WorkspaceIndexDriver();
-    this.ownsDriver = driver === undefined;
-    this.handle = this.driver.registerSpec<ImageSnapshot>({
+  constructor(index?: WorkspaceIndex<vscode.Uri>) {
+    this.index = index ?? createVscodeWorkspaceIndex();
+    this.ownsIndex = index === undefined;
+    this.handle = this.index.register<ImageSnapshot>({
       kind: "image",
       include: IMAGE_GLOB,
+      matchesPath: hasImageExtension,
       debounceMs: RESCAN_DEBOUNCE_MS,
       // Content changes do not alter the path index, but a refresh event lets
       // open webviews re-request image URIs if the host reports a replacement.
       watchContent: true,
       maxFiles: () => this.maxFiles(),
       notReady: () => new ImageSnapshot([], "notReady"),
-      disabled: () => new ImageSnapshot([], "disabled"),
-      build: async (root, files) =>
-        new ImageSnapshot(files.map((u) => relFromRoot(root, u))),
-      patchSnapshot: async (root, snapshot, patch) => {
+      build: async (_root, files) =>
+        new ImageSnapshot(files.map((f) => f.relativePath)),
+      patchSnapshot: async (_root, snapshot, patch) => {
         if (patch.mode === "content") return snapshot;
         return snapshot.patch(
-          patch.changedUris.map((uri) => relFromRoot(root, uri)),
-          patch.deletedUris.map((uri) => relFromRoot(root, uri))
+          patch.changed.map((f) => f.relativePath),
+          patch.deleted.map((f) => f.relativePath)
         );
       },
     });
-    this.refreshSub = this.driver.onDidRefresh((event) => {
-      if (event.kind === "image") this.emitter.fire();
-    });
+    this.refreshSub = this.handle.onDidRefresh(() => this.emitter.fire());
   }
 
   private maxFiles(): number {
@@ -67,7 +66,7 @@ export class ImageIndexService implements vscode.Disposable {
 
   /** Scan all workspace roots and start watching. Non-blocking at activation. */
   async initialize(): Promise<void> {
-    await this.driver.initialize();
+    await this.index.initialize();
   }
 
   /**
@@ -79,29 +78,28 @@ export class ImageIndexService implements vscode.Disposable {
     rawPath: string,
     requireImageExt: boolean
   ): vscode.Uri | undefined {
-    const folder = vscode.workspace.getWorkspaceFolder(documentUri);
-    if (!folder) return undefined; // single-file / outside any root → legacy
-    const snap = this.handle.snapshot(folder.uri);
-    if (!snap) return undefined;
-    const docRel = relFromRoot(folder.uri, documentUri);
-    const docDir = docRel.split("/").slice(0, -1).filter((s) => s.length > 0);
-    const entry = snap.resolve(docDir, rawPath, requireImageExt);
+    const resolved = this.handle.forDocument(documentUri);
+    if (!resolved) return undefined; // single-file / outside any root → legacy
+    const docDir = resolved.relativePath.split("/").slice(0, -1).filter((s) => s.length > 0);
+    const entry = resolved.snapshot.resolve(docDir, rawPath, requireImageExt);
     if (!entry) return undefined;
-    const uri = vscode.Uri.joinPath(folder.uri, ...entry.segments);
-    const version = this.handle.version(folder.uri);
-    return version > 0 ? uri.with({ query: `ofmIndex=${version}` }) : uri;
+    const uri = vscode.Uri.joinPath(resolved.root, ...entry.segments);
+    return resolved.version > 0 ? uri.with({ query: `ofmIndex=${resolved.version}` }) : uri;
   }
 
   /** Open/ready documents ask for a fresh reconciliation asynchronously. This
    *  covers external directory moves or bulk creates that watchers may fold or
    *  miss; resolution itself remains synchronous and I/O-free. */
   ensureFreshForDocument(documentUri: vscode.Uri, reason = "document-ready"): void {
-    this.handle.ensureFreshForDocument(documentUri, reason);
+    this.handle.ensureFresh(documentUri, reason, {
+      force: reason === "attachment-saved",
+    });
   }
 
   dispose(): void {
     this.refreshSub.dispose();
+    this.handle.dispose();
     this.emitter.dispose();
-    if (this.ownsDriver) this.driver.dispose();
+    if (this.ownsIndex) this.index.dispose();
   }
 }
