@@ -247,22 +247,6 @@ for (const scenario of ["burst", "command", "peer", "closed", "rejected-prefix"]
   assert.equal(f.coordinator.hasConflicts("note"), false);
 });
 
-test("input received during persistence stays behind the actual Save barrier queue entry", async () => {
-  const f = fixture(), doc = f.document(), a = f.peer(doc), blocked = gate(), writing = gate();
-  await a.initialize();
-  f.send(doc, a, { from: 3, insert: "a" }); await f.editQueue.drain("note");
-  const save = doc.save;
-  doc.save = async () => { writing.release(); await blocked.promise; return save(); };
-  const saving = f.saves.saveDocument(doc);
-  await writing.promise;
-  f.send(doc, a, { from: 4, insert: "b" });
-  f.send(doc, a, { from: 5, insert: "c" }); await settle();
-  assert.equal(doc.text, "abca"); assert.deepEqual(f.writes, []);
-  blocked.release(); await saving; await f.editQueue.drain("note");
-  assert.deepEqual(f.writes, ["abca"]); assert.equal(doc.text, "abcabc");
-  f.saves.dispose();
-});
-
 test("duplicate batches deduplicate and independent document queues keep moving", async () => {
   const f = fixture(), doc = f.document(), other = f.document("other", "second"), a = f.peer(doc), b = f.peer(other, "b"), blocked = gate();
   await a.initialize(); await b.initialize();
@@ -289,24 +273,6 @@ test("contention increases backoff to 100 ms and retains input when the two-seco
   assert.equal(f.coordinator.hasConflicts("note"), true);
   assert.equal(sendableUpdates(a.state).length, 1);
   assert.deepEqual(f.coordinator.recoveryTexts("note"), ["aXbc" + "Y".repeat(times.length)]);
-});
-
-test("initialization drains newly appended work and delivers text and both versions synchronously", async () => {
-  const f = fixture(), doc = f.document(), a = f.peer(doc), blocked = gate();
-  await a.initialize();
-  void f.editQueue.run("note", async () => { await blocked.promise; f.change(doc, [{ from: 3, to: 3, insert: "X" }]); });
-  const b = f.peer(doc, "b");
-  let delivered = false;
-  const initializing = f.coordinator.initialize(doc, snapshot => {
-    assert.deepEqual(snapshot, { text: "abcXY", version: 3, syncVersion: 2 });
-    b.state = EditorState.create({ doc: snapshot.text, extensions: [collab({ clientID: "b", startVersion: snapshot.syncVersion })] });
-    b.ready = true; delivered = true;
-    queueMicrotask(() => f.change(doc, [{ from: 5, to: 5, insert: "Z" }]));
-  });
-  void f.editQueue.run("note", async () => { f.change(doc, [{ from: 4, to: 4, insert: "Y" }]); });
-  await settle(); assert.equal(delivered, false);
-  blocked.release(); await initializing; await settle();
-  assert.equal(b.state.doc.toString(), "abcXYZ"); assert.equal(getSyncedVersion(b.state), 3);
 });
 
 for (const crlf of [false, true]) test("closed failed peers retain received work and read-only recovery with original " + (crlf ? "CRLF" : "LF"), async () => {

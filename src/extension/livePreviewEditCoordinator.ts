@@ -64,7 +64,13 @@ export class LivePreviewEditCoordinator<Document extends EditDocument, Peer exte
     isCurrent: () => boolean = () => true,
   ): Promise<void> {
     const key = document.uri.toString();
-    await this.options.editQueue.drain(key);
+    const queue = this.options.editQueue;
+    let tail: Promise<unknown>;
+    do {
+      tail = queue.idle(key);
+      await queue.drain(key);
+      // Another edit can arrive between the drain check and this continuation.
+    } while (queue.idle(key) !== tail);
     if (!isCurrent()) return;
     const snapshot = this.options.host.read(document);
     const authority = this.authority(document, snapshot);

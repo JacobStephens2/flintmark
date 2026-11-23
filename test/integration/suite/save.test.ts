@@ -3,9 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { EditorState } from "@codemirror/state";
-import { collab, getSyncedVersion, receiveUpdates, sendableUpdates } from "@codemirror/collab";
-import { decodeUpdates, encodeUpdates } from "../../../src/shared/collaboration";
+import { sendableUpdates } from "@codemirror/collab";
+import { livePreviewPeer } from "../../fixtures/livePreviewPeer";
 import { livePreviewFixture, waitForSynchronization } from "./livePreviewFixture";
 import type { Peer } from "./livePreviewFixture";
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -21,39 +20,24 @@ describe("Save barriers with real VS Code disk writes", () => {
       await vscode.window.showTextDocument(document);
       const subscriptions: vscode.Disposable[] = [];
       const { host, openPeer, synchronization } = livePreviewFixture(document, subscriptions);
-      const clients = new Map<Peer, EditorState>();
       let receipts = 0;
       const makePanel = (id: string) => {
+        const panel = livePreviewPeer(id);
         let buffered = true;
-        const panel: Peer = { webview: { postMessage: message => {
-          if (message.type === "init") {
-            clients.set(panel, EditorState.create({
-              doc: message.text.replace(/\r\n/g, "\n"),
-              extensions: [collab({ clientID: id, startVersion: message.syncVersion })],
-            }));
+        panel.onFlush = async requestId => {
+          // Neither this input nor its receipt is in the host at save entry.
+          await sleep(20);
+          if (buffered) {
+            buffered = false;
+            send(panel, id + " answer.\n");
           }
-          if (message.type === "syncUpdates") clients.set(panel, clients.get(panel)!.update(receiveUpdates(clients.get(panel)!, decodeUpdates(message.updates))).state);
-          if (message.type === "flush") {
-            void (async () => {
-              // Neither this input nor its receipt is in the host at save entry.
-              await sleep(20);
-              if (buffered) { buffered = false; send(panel, id + " answer.\n"); }
-              receipts++;
-              synchronization.acknowledgeFlush(panel, message.requestId);
-            })();
-          }
-          return Promise.resolve(true);
-        } } };
+          receipts++;
+          synchronization.acknowledgeFlush(panel, requestId);
+        };
         return panel;
       };
-      function send(panel: Peer, insert: string) {
-        const current = clients.get(panel)!;
-        const next = current.update({changes:{from:current.doc.length,insert}}).state;
-        clients.set(panel,next);
-        synchronization.submitEdit(document, panel, {
-          type: "edit", version: document.version,
-          syncVersion: getSyncedVersion(next), updates: encodeUpdates(sendableUpdates(next)),
-        });
+      function send(panel: ReturnType<typeof livePreviewPeer>, insert: string) {
+        synchronization.submitEdit(document, panel, panel.edit(document.version, { from: panel.state.doc.length, insert }));
       }
       const a = makePanel("FIRST"), b = makePanel("SECOND");
       await openPeer(a);
@@ -86,7 +70,7 @@ describe("Save barriers with real VS Code disk writes", () => {
             event.waitUntil(sleep(60).then(() => []));
           }));
           assert.equal(await synchronization.saveDocument(document), true);
-          await waitForSynchronization(() => sendableUpdates(clients.get(a)!).length === 0, "the edit received during persistence");
+          await waitForSynchronization(() => sendableUpdates(a.state).length === 0, "the edit received during persistence");
           assert.equal(fs.readFileSync(file,"utf8").includes("AFTER save barrier."),false,"later input must not race the earlier disk write");
           assert.equal(document.isDirty,true,"later edits remain visibly unsaved");
           assert.equal(await synchronization.saveDocument(document), true);
@@ -111,8 +95,8 @@ describe("Save barriers with real VS Code disk writes", () => {
         assert.equal(disk.includes("FIRST answer."),true);
         assert.equal(disk.includes("SECOND answer."),true);
         assert.equal(document.isDirty,false);
-        assert.equal(disk.replace(/\r\n/g,"\n"),clients.get(a)!.doc.toString());
-        assert.equal(clients.get(a)!.doc.toString(),clients.get(b)!.doc.toString());
+        assert.equal(disk.replace(/\r\n/g,"\n"), a.state.doc.toString());
+        assert.equal(a.state.doc.toString(), b.state.doc.toString());
         if (eol === "CRLF") assert.equal(/(?<!\r)\n/.test(disk),false);
       } finally {
         if (entry === "auto-dirty") {
@@ -135,23 +119,20 @@ describe("Save barrier failures", () => {
       const subscriptions: vscode.Disposable[]=[];
       const { host, openPeer, synchronization } = livePreviewFixture(document, subscriptions);
       const wrongPeer: Peer = { webview: { postMessage: () => true } };
-      const panel: Peer = { webview: { postMessage(message) {
-        if (message.type !== "flush") return true;
+      const panel = livePreviewPeer("failed-peer");
+      const post = panel.webview.postMessage;
+      panel.webview.postMessage = message => {
+        if (message.type !== "flush") return post(message);
         if (failure === "undelivered") return false;
         if (failure === "timeout") return true;
         queueMicrotask(() => synchronization.acknowledgeFlush(failure === "wrong-peer" ? wrongPeer : panel, message.requestId));
         return true;
-      } } };
+      };
       await openPeer(panel);
       const apply = host.apply;
       if (failure === "conflict") {
         host.apply = async () => false;
-        const client=EditorState.create({doc:"original\n",extensions:[collab({clientID:"failed-peer"})]})
-          .update({changes:{from:9,insert:"pending\n"}}).state;
-        synchronization.submitEdit(document, panel, {
-          type: "edit", version: document.version,
-          syncVersion: getSyncedVersion(client), updates: encodeUpdates(sendableUpdates(client)),
-        });
+        synchronization.submitEdit(document, panel, panel.edit(document.version, { from: 9, insert: "pending\n" }));
       }
       try {
         await assert.rejects(synchronization.saveDocument(document),failure==="conflict"?/unsynchronized/:failure==="undelivered"?/closed/:/did not respond/);
@@ -160,10 +141,8 @@ describe("Save barrier failures", () => {
         // than by inspecting the coordinator's private request registry.
         host.apply = apply;
         if (failure === "conflict") synchronization.retry(document);
-        panel.webview.postMessage = message => {
-          if (message.type === "flush") queueMicrotask(() => synchronization.acknowledgeFlush(panel, message.requestId));
-          return true;
-        };
+        panel.webview.postMessage = post;
+        panel.onFlush = requestId => queueMicrotask(() => synchronization.acknowledgeFlush(panel, requestId));
         assert.equal(await synchronization.saveDocument(document), true);
         assert.equal(fs.readFileSync(file,"utf8"),failure==="conflict"?"original\npending\n":"original\n");
       } finally {for(const subscription of subscriptions)subscription.dispose();}
@@ -188,27 +167,16 @@ describe("Slow native disk writes", () => {
     const document=await vscode.workspace.openTextDocument(vscode.Uri.parse(scheme+":/note.md"));
     await vscode.window.showTextDocument(document);
     const { host, openPeer, synchronization } = livePreviewFixture(document, subscriptions);
-    let pendingInput: EditorState | undefined;
-    const panel: Peer = { webview: { postMessage(message) {
-      if (message.type === "init") {
-        const client = EditorState.create({
-          doc: message.text,
-          extensions: [collab({ clientID: "slow-peer", startVersion: message.syncVersion })],
-        });
-        pendingInput = client.update({ changes: { from: client.doc.length, insert: "Complete pending answer.\n" } }).state;
+    const panel = livePreviewPeer("slow-peer");
+    let buffered = true;
+    panel.onFlush = requestId => {
+      if (buffered) {
+        buffered = false;
+        const edit = panel.edit(document.version, { from: panel.state.doc.length, insert: "Complete pending answer.\n" });
+        synchronization.submitEdit(document, panel, edit);
       }
-      if (message.type === "flush") {
-        if (pendingInput) {
-          synchronization.submitEdit(document, panel, {
-            type: "edit", version: document.version,
-            syncVersion: getSyncedVersion(pendingInput), updates: encodeUpdates(sendableUpdates(pendingInput)),
-          });
-          pendingInput = undefined;
-        }
-        queueMicrotask(() => synchronization.acknowledgeFlush(panel, message.requestId));
-      }
-      return true;
-    } } };
+      queueMicrotask(() => synchronization.acknowledgeFlush(panel, requestId));
+    };
     await openPeer(panel);
     const apply = host.apply;
     host.apply = async (...args) => {

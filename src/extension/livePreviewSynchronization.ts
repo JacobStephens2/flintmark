@@ -89,9 +89,9 @@ export class LivePreviewSynchronization<Document extends SaveDocument, Peer exte
     if (!registration) return;
     const isCurrent = () => this.peers.get(uri)?.get(peer) === registration;
     await this.edits.initialize(document, snapshot => {
-      const details = presentation();
+      const { settings, theme, vault } = presentation();
       if (!isCurrent()) return;
-      peer.webview.postMessage({ type: "init", uri, ...snapshot, ...details });
+      peer.webview.postMessage({ type: "init", uri, ...snapshot, settings, theme, vault });
       if (!isCurrent()) return;
       registration.ready = true;
       afterReady?.();

@@ -3,33 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { EditorState } from "@codemirror/state";
-import { collab, getSyncedVersion, receiveUpdates, sendableUpdates } from "@codemirror/collab";
+import { sendableUpdates } from "@codemirror/collab";
+import { livePreviewPeer } from "../../fixtures/livePreviewPeer";
 import { livePreviewFixture, waitForSynchronization } from "./livePreviewFixture";
 import type { Peer } from "./livePreviewFixture";
-import { decodeUpdates, encodeUpdates } from "../../../src/shared/collaboration";
-import type { HostMsg } from "../../../src/shared/protocol";
 
 function collaborationPeer(clientID: string, acknowledge: (peer: Peer, requestId: number) => void) {
-  const messages: HostMsg[] = [];
-  const peer = {
-    state: EditorState.create(),
-    messages,
-    webview: { postMessage(message: HostMsg) {
-      messages.push(message);
-      if (message.type === "init") {
-        peer.state = EditorState.create({
-          doc: message.text.replace(/\r\n/g, "\n"),
-          extensions: [collab({ clientID, startVersion: message.syncVersion })],
-        });
-      }
-      if (message.type === "syncUpdates") {
-        peer.state = peer.state.update(receiveUpdates(peer.state, decodeUpdates(message.updates))).state;
-      }
-      if (message.type === "flush") queueMicrotask(() => acknowledge(peer, message.requestId));
-      return true;
-    } },
-  };
+  const peer = livePreviewPeer(clientID);
+  peer.onFlush = requestId => queueMicrotask(() => acknowledge(peer, requestId));
   return peer;
 }
 
@@ -49,9 +30,6 @@ describe("Collaboration acknowledgments in the real extension host", () => {
       const { host, openPeer, synchronization } = livePreviewFixture(document, subscriptions);
       const panel = collaborationPeer("test-panel", (peer, id) => synchronization.acknowledgeFlush(peer, id));
       await openPeer(panel);
-      panel.state = panel.state.update({ changes: scenario === "noop-external"
-        ? { from: 1, to: 2, insert: "b" }
-        : { from: 1, insert: "X" } }).state;
       const apply = host.apply;
       let attempts = 0;
       let rejections = 0;
@@ -86,10 +64,8 @@ describe("Collaboration acknowledgments in the real extension host", () => {
         return ownApplied;
       };
       try {
-        synchronization.submitEdit(document, panel, {
-          type: "edit", version: document.version,
-          syncVersion: getSyncedVersion(panel.state), updates: encodeUpdates(sendableUpdates(panel.state)),
-        });
+        const change = scenario === "noop-external" ? { from: 1, to: 2, insert: "b" } : { from: 1, insert: "X" };
+        synchronization.submitEdit(document, panel, panel.edit(document.version, change));
         await waitForSynchronization(() => sendableUpdates(panel.state).length === 0, "the edit acknowledgment");
         const expected = scenario === "coincident" ? "aXXbc"
           : scenario === "noop-external" ? "abcY"
@@ -126,9 +102,7 @@ describe("Cumulative input batches behind a slow native edit", () => {
       await openPeer(a);
       await openPeer(b);
       function send(panel: typeof a, text: string) {
-        const next = panel.state.update({ changes: { from: panel.state.doc.length, insert: text } }).state;
-        panel.state = next;
-        synchronization.submitEdit(document, panel, { type: "edit", version: document.version, syncVersion: getSyncedVersion(next), updates: encodeUpdates(sendableUpdates(next)) });
+        synchronization.submitEdit(document, panel, panel.edit(document.version, { from: panel.state.doc.length, insert: text }));
       }
       let release!: () => void, entered!: () => void;
       const gate = new Promise<void>(resolve => { release = resolve; });
@@ -189,13 +163,7 @@ describe("Cumulative input batches behind a slow native edit", () => {
     };
 
     const sendAt = (from: number, insert: string) => {
-      panel.state = panel.state.update({ changes: { from, to: from, insert } }).state;
-      synchronization.submitEdit(document, panel, {
-        type: "edit",
-        version: document.version,
-        syncVersion: getSyncedVersion(panel.state),
-        updates: encodeUpdates(sendableUpdates(panel.state)),
-      });
+      synchronization.submitEdit(document, panel, panel.edit(document.version, { from, insert }));
     };
 
     let releaseFirst!: () => void;

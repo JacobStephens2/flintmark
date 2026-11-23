@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { collab, getSyncedVersion, receiveUpdates, sendableUpdates } from "@codemirror/collab";
-import { ChangeSet, EditorState, Text } from "@codemirror/state";
+import { getSyncedVersion } from "@codemirror/collab";
+import { ChangeSet, Text } from "@codemirror/state";
 import type { ChangeSpec } from "@codemirror/state";
 import { LivePreviewSynchronization } from "../../src/extension/livePreviewSynchronization";
-import { decodeUpdates, encodeUpdates } from "../../src/shared/collaboration";
-import type { DocChange, HostMsg } from "../../src/shared/protocol";
+import type { DocChange } from "../../src/shared/protocol";
+import { livePreviewPeer } from "../fixtures/livePreviewPeer";
 
 function gate() {
   let release!: () => void;
@@ -12,9 +12,10 @@ function gate() {
   return { promise, release };
 }
 
-function fixture() {
+function fixture(
+  executeHistory: (command: "undo" | "redo", document: { text: string }) => Promise<void> = async () => {},
+) {
   const writes: string[] = [];
-  const errors: unknown[] = [];
   const document = {
     uri: { toString: () => "file:///note.md" },
     text: "abc",
@@ -34,17 +35,15 @@ function fixture() {
       return true;
     },
   };
-  const history = async (_command: "undo" | "redo", _document: typeof document) => {};
-  const options = {
+  type Peer = ReturnType<typeof peer>;
+  const sync = new LivePreviewSynchronization<typeof document, Peer>({
     host,
-    executeHistory: history,
+    executeHistory,
     forceSave: () => document.save(),
     notifyConflict: () => {},
     notifyRecovery: () => {},
-    reportError: (error: unknown) => { errors.push(error); },
-  };
-  type Peer = ReturnType<typeof peer>;
-  const sync = new LivePreviewSynchronization<typeof document, Peer>(options);
+    reportError: error => assert.fail(String(error)),
+  });
 
   function change(changes: readonly DocChange[]) {
     const before = Text.of(document.text.split("\n"));
@@ -61,27 +60,8 @@ function fixture() {
   }
 
   function peer(id: string, visible = true) {
-    const messages: HostMsg[] = [];
-    const registered = {
-      visible,
-      messages,
-      state: EditorState.create(),
-      onFlush: (requestId: number) => sync.acknowledgeFlush(registered, requestId),
-      webview: { postMessage: (message: HostMsg) => {
-        messages.push(message);
-        if (message.type === "init") {
-          registered.state = EditorState.create({
-            doc: message.text,
-            extensions: [collab({ clientID: id, startVersion: message.syncVersion })],
-          });
-        }
-        if (message.type === "syncUpdates") {
-          registered.state = registered.state.update(receiveUpdates(registered.state, decodeUpdates(message.updates))).state;
-        }
-        if (message.type === "flush") registered.onFlush(message.requestId);
-        return true;
-      } },
-    };
+    const registered = Object.assign(livePreviewPeer(id), { visible });
+    registered.onFlush = requestId => sync.acknowledgeFlush(registered, requestId);
     sync.registerPeer(document, registered);
     return registered;
   }
@@ -91,13 +71,9 @@ function fixture() {
   }
 
   function send(peer: Peer, changes: ChangeSpec) {
-    peer.state = peer.state.update({ changes }).state;
-    sync.submitEdit(document, peer, {
-      type: "edit", version: document.version,
-      syncVersion: getSyncedVersion(peer.state), updates: encodeUpdates(sendableUpdates(peer.state)),
-    });
+    sync.submitEdit(document, peer, peer.edit(document.version, changes));
   }
-  return { change, document, errors, host, options, peer, ready, send, sync, writes };
+  return { change, document, host, peer, ready, send, sync, writes };
 }
 
 const cases: { name: string; run: () => Promise<void> }[] = [];
@@ -135,10 +111,56 @@ test("ready sees queued edits and publishes init before its same-turn follow-up"
   const initMessage = newcomer.messages.find(message => message.type === "init");
   assert.deepEqual(initMessage && [initMessage.text, initMessage.version, initMessage.syncVersion], ["abcXY", 3, 2]);
   assert.equal(newcomer.state.doc.toString(), "abcXYZ");
+  assert.equal(getSyncedVersion(newcomer.state), 3);
   assert.equal(closing.messages.length, 0);
   assert.equal(sync.isReady(document.uri.toString(), closing), false);
   await ready(newcomer);
   assert.equal(newcomer.messages.filter(message => message.type === "init").length, 2);
+  await sync.dispose();
+});
+
+test("init includes edits received before delivery when the ready drain is ending", async () => {
+  const { peer, ready, send, sync } = fixture();
+  const editing = peer("editing");
+  await ready(editing);
+  const newcomer = peer("newcomer");
+  let submitted = false;
+  let submittedBeforeInit = false;
+  const init = ready(newcomer, () => { submittedBeforeInit = submitted; });
+  queueMicrotask(() => queueMicrotask(() => {
+    submitted = true;
+    send(editing, { from: 3, insert: "X" });
+  }));
+  await init;
+  const first = newcomer.messages.find(message => message.type === "init");
+  assert.deepEqual(
+    first && [first.text, first.version, first.syncVersion],
+    submittedBeforeInit ? ["abcX", 2, 1] : ["abc", 1, 0],
+  );
+  await sync.dispose();
+});
+
+test("init uses authoritative text and versions even if the presentation carries stale values", async () => {
+  const { document, peer, sync } = fixture();
+  const opening = peer("opening");
+  const presentation = {
+    settings: { lineWidth: 60 },
+    theme: { id: "test", cssUri: null },
+    text: "stale",
+    version: 20,
+    syncVersion: 30,
+  };
+  await sync.initializePeer(document, opening, () => presentation);
+  assert.deepEqual(opening.messages[0], {
+    type: "init",
+    uri: document.uri.toString(),
+    text: "abc",
+    version: 1,
+    syncVersion: 0,
+    settings: presentation.settings,
+    theme: presentation.theme,
+    vault: undefined,
+  });
   await sync.dispose();
 });
 
@@ -237,20 +259,19 @@ test("last close cancels its flush and preserves failed input until retry, then 
 });
 
 test("received edits and native history commands stay ordered across a command and a disk write", async () => {
-  const { document, options, peer, ready, send, sync, writes } = fixture();
-  const editing = peer("editing");
-  await ready(editing);
   const commandStarted = gate(), releaseCommand = gate();
   const writeStarted = gate(), releaseWrite = gate();
   const flush = gate();
   const history: string[] = [];
-  options.executeHistory = async (command, doc) => {
+  const { document, peer, ready, send, sync, writes } = fixture(async (command, doc) => {
     history.push(command + " " + doc.text);
     if (command === "undo") {
       commandStarted.release();
       await releaseCommand.promise;
     }
-  };
+  });
+  const editing = peer("editing");
+  await ready(editing);
   const write = document.save;
   document.save = async () => {
     writeStarted.release();
@@ -268,20 +289,24 @@ test("received edits and native history commands stay ordered across a command a
   const save = sync.saveDocument(document);
   await flush.promise;
   send(editing, { from: 4, insert: "Y" });
+  await new Promise<void>(resolve => setImmediate(resolve));
   assert.equal(document.text, "abcX");
   releaseCommand.release();
   await undo;
   await writeStarted.promise;
 
   send(editing, { from: 5, insert: "Z" });
+  send(editing, { from: 6, insert: "!" });
   const redo = sync.runHistoryCommand(document, "redo");
+  await new Promise<void>(resolve => setImmediate(resolve));
   assert.equal(document.text, "abcXY");
+  assert.deepEqual(writes, []);
   releaseWrite.release();
   assert.equal(await save, true);
   await redo;
   assert.deepEqual(writes, ["abcXY"]);
-  assert.deepEqual(history, ["undo abcX", "redo abcXYZ"]);
-  assert.equal(document.text, "abcXYZ");
+  assert.deepEqual(history, ["undo abcX", "redo abcXYZ!"]);
+  assert.equal(document.text, "abcXYZ!");
   assert.equal(document.isDirty, true);
   await sync.dispose();
 });
