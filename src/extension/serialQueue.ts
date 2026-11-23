@@ -42,6 +42,11 @@ export class SerialQueue {
     }
   }
 
+  /** Drain known keys after the owner stops accepting new work. */
+  async drainAll(): Promise<void> {
+    await Promise.all([...this.chains.keys()].map(key => this.drain(key)));
+  }
+
   /** Drop all chains (e.g. on dispose). In-flight tasks still settle. */
   clear(): void {
     this.chains.clear();

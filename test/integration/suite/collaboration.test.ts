@@ -3,10 +3,16 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { EditorState } from "@codemirror/state";
-import { collab, getSyncedVersion, receiveUpdates, sendableUpdates } from "@codemirror/collab";
-import { livePreviewFixture } from "./livePreviewFixture";
-import { decodeUpdates, encodeUpdates } from "../../../src/shared/collaboration";
+import { sendableUpdates } from "@codemirror/collab";
+import { livePreviewPeer } from "../../fixtures/livePreviewPeer";
+import { livePreviewFixture, waitForSynchronization } from "./livePreviewFixture";
+import type { Peer } from "./livePreviewFixture";
+
+function collaborationPeer(clientID: string, acknowledge: (peer: Peer, requestId: number) => void) {
+  const peer = livePreviewPeer(clientID);
+  peer.onFlush = requestId => queueMicrotask(() => acknowledge(peer, requestId));
+  return peer;
+}
 
 // Real TextDocuments, change events, WorkspaceEdit version validation and disk
 // writes; only the webview transport is simulated. All CodeMirror imports use
@@ -21,36 +27,13 @@ describe("Collaboration acknowledgments in the real extension host", () => {
       fs.writeFileSync(file, initial);
       const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
       const subscriptions: vscode.Disposable[] = [];
-      const f = livePreviewFixture(document, subscriptions);
-      await f.edits.initialize(document, () => {});
-      let client = EditorState.create({
-        doc: initial.replace(/\r\n/g, "\n"),
-        extensions: [collab({ clientID: "test-panel" })],
-      });
-      client = client.update({ changes: scenario === "noop-external"
-        ? { from: 1, to: 2, insert: "b" }
-        : { from: 1, insert: "X" } }).state;
-      const messages: any[] = [];
-      const panel = {
-        active: true,
-        webview: {
-          asWebviewUri: (uri: vscode.Uri) => uri,
-          postMessage: (message: any) => {
-            if (message.type === "flush") queueMicrotask(() => { f.saves.acknowledge(panel, message.requestId); });
-            messages.push(message);
-            if (message.type === "syncUpdates") {
-              client = client.update(receiveUpdates(client, decodeUpdates(message.updates))).state;
-            }
-            return Promise.resolve(true);
-          },
-        },
-      };
-      const key = document.uri.toString();
-      f.addPeer(panel);
-      const apply = f.host.apply;
+      const { host, openPeer, synchronization } = livePreviewFixture(document, subscriptions);
+      const panel = collaborationPeer("test-panel", (peer, id) => synchronization.acknowledgeFlush(peer, id));
+      await openPeer(panel);
+      const apply = host.apply;
       let attempts = 0;
       let rejections = 0;
-      f.host.apply = async (doc: vscode.TextDocument, changes: Parameters<typeof apply>[1]) => {
+      host.apply = async (doc, changes) => {
         attempts++;
         if (scenario === "noop-external") {
           const applied = await apply(doc, changes);
@@ -81,19 +64,16 @@ describe("Collaboration acknowledgments in the real extension host", () => {
         return ownApplied;
       };
       try {
-        f.edits.submit(document, panel, {
-          type: "edit", version: document.version,
-          syncVersion: getSyncedVersion(client), updates: encodeUpdates(sendableUpdates(client)),
-        });
-        await f.queue.idle(key);
+        const change = scenario === "noop-external" ? { from: 1, to: 2, insert: "b" } : { from: 1, insert: "X" };
+        synchronization.submitEdit(document, panel, panel.edit(document.version, change));
+        await waitForSynchronization(() => sendableUpdates(panel.state).length === 0, "the edit acknowledgment");
         const expected = scenario === "coincident" ? "aXXbc"
           : scenario === "noop-external" ? "abcY"
           : multiline ? "aX\nb\nc"
           : "aXbc" + "Y".repeat(scenario === "nine-conflicts" ? 9 : 1);
         assert.equal(document.getText().replace(/\r\n/g, "\n"), expected);
-        assert.equal(client.doc.toString(), expected);
-        assert.equal(sendableUpdates(client).length, 0, "must converge without manual resubmission");
-        assert.equal(messages.some(message => message.type === "syncError"), false);
+        assert.equal(panel.state.doc.toString(), expected);
+        assert.equal(panel.messages.some(message => message.type === "syncError"), false);
         assert.equal(rejections, scenario === "noop-external" ? 0 : scenario === "nine-conflicts" ? 9 : 1);
         await document.save();
         assert.equal(fs.readFileSync(file, "utf8"), scenario === "to-crlf" ? expected.replace(/\n/g, "\r\n") : expected);
@@ -112,34 +92,24 @@ describe("Cumulative input batches behind a slow native edit", () => {
       fs.writeFileSync(file, initial);
       const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
       const subscriptions: vscode.Disposable[] = [];
-      const f = livePreviewFixture(document, subscriptions);
-      await f.edits.initialize(document, () => {});
-      const key = document.uri.toString(), messages: any[] = [];
-      const clients = new Map<string, EditorState>();
-      function makePanel(id: string) {
-        clients.set(id, EditorState.create({ doc: initial, extensions: [collab({ clientID: id })] }));
-        const panel = { active: true, webview: { asWebviewUri: (uri: vscode.Uri) => uri, postMessage: (message: any) => {
-            if (message.type === "flush") queueMicrotask(() => { f.saves.acknowledge(panel, message.requestId); });
-          messages.push(message);
-          if (message.type === "syncUpdates") clients.set(id, clients.get(id)!.update(receiveUpdates(clients.get(id)!, decodeUpdates(message.updates))).state);
-          return Promise.resolve(true);
-        } } };
-        return panel;
-      }
+      let barrierText: string | undefined;
+      const { host, openPeer, synchronization } = livePreviewFixture(document, subscriptions, async (command, doc) => {
+        assert.equal(command, "undo");
+        barrierText = doc.getText();
+      });
+      const makePanel = (id: string) => collaborationPeer(id, (peer, requestId) => synchronization.acknowledgeFlush(peer, requestId));
       const a = makePanel("a"), b = makePanel("b");
-      f.addPeer(a); f.addPeer(b);
-      function send(panel: typeof a, id: string, text: string) {
-        const state = clients.get(id)!;
-        const next = state.update({ changes: { from: state.doc.length, insert: text } }).state;
-        clients.set(id, next);
-        f.edits.submit(document, panel, { type: "edit", version: document.version, syncVersion: getSyncedVersion(next), updates: encodeUpdates(sendableUpdates(next)) });
+      await openPeer(a);
+      await openPeer(b);
+      function send(panel: typeof a, text: string) {
+        synchronization.submitEdit(document, panel, panel.edit(document.version, { from: panel.state.doc.length, insert: text }));
       }
       let release!: () => void, entered!: () => void;
       const gate = new Promise<void>(resolve => { release = resolve; });
       const started = new Promise<void>(resolve => { entered = resolve; });
-      const apply = f.host.apply;
-      let calls = 0, active = 0, maxActive = 0, barrierText: string | undefined;
-      f.host.apply = async (doc: vscode.TextDocument, changes: Parameters<typeof apply>[1]) => {
+      const apply = host.apply;
+      let calls = 0, active = 0, maxActive = 0;
+      host.apply = async (doc, changes) => {
         calls++; active++; maxActive = Math.max(maxActive, active);
         try {
           if (calls === 1) { entered(); await gate; if (scenario === "rejected-first") return false; }
@@ -147,26 +117,26 @@ describe("Cumulative input batches behind a slow native edit", () => {
         } finally { active--; }
       };
       try {
-        send(a, "a", "a"); await started;
-        for (const ch of "bcd") send(a, "a", ch);
-        if (scenario === "command-barrier") void f.queue.run(key, async () => { barrierText = document.getText(); });
-        if (scenario === "second-panel") send(b, "b", "FOREIGN");
-        for (const ch of "efghijklmnopqrstuvwxyz") send(a, "a", ch);
-        if (scenario === "closed-panel") { f.closePeer(a); }
-        release(); await f.queue.idle(key); await Promise.resolve();
+        send(a, "a"); await started;
+        for (const ch of "bcd") send(a, ch);
+        const command = scenario === "command-barrier" ? synchronization.runHistoryCommand(document, "undo") : undefined;
+        if (scenario === "second-panel") send(b, "FOREIGN");
+        for (const ch of "efghijklmnopqrstuvwxyz") send(a, ch);
+        if (scenario === "closed-panel") synchronization.unregisterPeer(document, a);
+        release();
+        await command;
         const expected = initial + "abcdefghijklmnopqrstuvwxyz";
+        await waitForSynchronization(() => b.state.doc.toString().replace("FOREIGN", "") === expected, "the complete input burst");
         assert.equal(document.getText().replace("FOREIGN", ""), expected);
         assert.equal(maxActive, 1, "native edits must remain strictly serial");
         assert.equal(calls, scenario === "command-barrier" ? 3 : scenario === "second-panel" ? 4 : 2, "a blocked typing burst must not produce one API call per character");
         if (scenario === "command-barrier") assert.equal(barrierText, initial + "abcd", "later input must not cross a queued command");
         if (scenario === "second-panel") assert.ok(document.getText().includes("FOREIGN"));
-        for (const [id, state] of clients) {
-          if (scenario === "closed-panel" && id === "a") continue;
-          assert.equal(state.doc.toString(), document.getText());
-          assert.equal(sendableUpdates(state).length, 0, "all individual collaboration updates must be acknowledged");
+        for (const panel of scenario === "closed-panel" ? [b] : [a, b]) {
+          assert.equal(panel.state.doc.toString(), document.getText());
+          assert.equal(sendableUpdates(panel.state).length, 0, "all individual collaboration updates must be acknowledged");
         }
-        assert.equal(f.edits.hasConflicts(key), false, "the complete later batch must recover a rejected prefix");
-        await document.save();
+        assert.equal(await synchronization.saveDocument(document), true, "the complete later batch must recover a rejected prefix");
         assert.equal(fs.readFileSync(file, "utf8"), document.getText());
       } finally { release(); for (const subscription of subscriptions) subscription.dispose(); }
     });
@@ -179,45 +149,21 @@ describe("Cumulative input batches behind a slow native edit", () => {
     fs.writeFileSync(file, initial);
     const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
     const subscriptions: vscode.Disposable[] = [];
-    const f = livePreviewFixture(document, subscriptions);
-    await f.edits.initialize(document, () => {});
-    const key = document.uri.toString();
-    let client = EditorState.create({
-      doc: initial,
-      extensions: [collab({ clientID: "panel-save" })],
-    });
-    const panel = {
-      active: true,
-      webview: {
-        asWebviewUri: (uri: vscode.Uri) => uri,
-        postMessage: (message: any) => {
-            if (message.type === "flush") queueMicrotask(() => { f.saves.acknowledge(panel, message.requestId); });
-          if (message.type === "syncUpdates") {
-            client = client.update(receiveUpdates(client, decodeUpdates(message.updates))).state;
-          }
-          return Promise.resolve(true);
-        },
-      },
-    };
-    f.addPeer(panel);
+    const { host, openPeer, synchronization } = livePreviewFixture(document, subscriptions);
+    const panel = collaborationPeer("panel-save", (peer, id) => synchronization.acknowledgeFlush(peer, id));
+    await openPeer(panel);
 
     const answerOffset = (index: number) => {
       const marker = "*Answer:* ";
       let pos = -1;
       for (let i = 0; i <= index; i++) {
-        pos = client.doc.toString().indexOf(marker, pos + 1);
+        pos = panel.state.doc.toString().indexOf(marker, pos + 1);
       }
       return pos + marker.length;
     };
 
     const sendAt = (from: number, insert: string) => {
-      client = client.update({ changes: { from, to: from, insert } }).state;
-      f.edits.submit(document, panel, {
-        type: "edit",
-        version: document.version,
-        syncVersion: getSyncedVersion(client),
-        updates: encodeUpdates(sendableUpdates(client)),
-      });
+      synchronization.submitEdit(document, panel, panel.edit(document.version, { from, insert }));
     };
 
     let releaseFirst!: () => void;
@@ -228,9 +174,9 @@ describe("Cumulative input batches behind a slow native edit", () => {
     const firstStarted = new Promise<void>((r) => { enteredFirst = r; });
     const secondGate = new Promise<void>((r) => { releaseSecond = r; });
     const secondStarted = new Promise<void>((r) => { enteredSecond = r; });
-    const apply = f.host.apply;
+    const apply = host.apply;
     let callCount = 0;
-    f.host.apply = async (doc: vscode.TextDocument, changes: Parameters<typeof apply>[1]) => {
+    host.apply = async (doc, changes) => {
       callCount++;
       if (callCount === 1) {
         enteredFirst();
@@ -248,7 +194,7 @@ describe("Cumulative input batches behind a slow native edit", () => {
       await firstStarted;
 
       // 2. While "agree, " is in flight, requestSave arrives AND user finishes Answer 1.
-      const requestSaveDone = f.saves.saveDocument(document);
+      const requestSaveDone = synchronization.saveDocument(document);
       sendAt(answerOffset(0) + "agree, ".length, "full first answer.");
 
       // 3. First edit ("agree, ") finishes and ACKs (advancing syncVersion to 1),
@@ -260,7 +206,7 @@ describe("Cumulative input batches behind a slow native edit", () => {
       sendAt(answerOffset(3), "fourth answer.");
 
       setTimeout(releaseSecond, 30);
-      await requestSaveDone;
+      assert.equal(await requestSaveDone, true);
 
       const expected = [
         "# Review",
@@ -284,20 +230,20 @@ describe("Cumulative input batches behind a slow native edit", () => {
       // 4. Verify native document.save() (File > Save / workbench.action.files.save)
       //    when the document is already dirty from a prefix edit and the rest of the
       //    edits are still in flight in editQueue.
-      sendAt(client.doc.length, "\nFooter: ");
-      await f.queue.drain(key);
+      sendAt(panel.state.doc.length, "\nFooter: ");
+      await waitForSynchronization(() => sendableUpdates(panel.state).length === 0, "the footer acknowledgment");
       assert.equal(document.isDirty, true);
 
       let releaseThird!: () => void;
       let enteredThird!: () => void;
       const thirdGate = new Promise<void>((r) => { releaseThird = r; });
       const thirdStarted = new Promise<void>((r) => { enteredThird = r; });
-      f.host.apply = async (doc: vscode.TextDocument, changes: Parameters<typeof apply>[1]) => {
+      host.apply = async (doc, changes) => {
         enteredThird();
         await thirdGate;
         return apply(doc, changes);
       };
-      sendAt(client.doc.length, "complete paragraph.\n");
+      sendAt(panel.state.doc.length, "complete paragraph.\n");
       await thirdStarted;
       setTimeout(releaseThird, 30);
       await document.save();

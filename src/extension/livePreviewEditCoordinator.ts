@@ -6,8 +6,8 @@ import type { DocChange, HostMsg, WebviewMsg } from "../shared/protocol";
 import { SerialQueue } from "./serialQueue";
 
 type EditDocument = { readonly uri: { toString(): string } };
-type EditPeer = { readonly webview: { postMessage(message: HostMsg): boolean | PromiseLike<boolean> } };
-type EditMessage = Extract<WebviewMsg, { type: "edit" }>;
+export type EditPeer = { readonly webview: { postMessage(message: HostMsg): boolean | PromiseLike<boolean> } };
+export type EditMessage = Extract<WebviewMsg, { type: "edit" }>;
 export type DocumentSnapshot = { text: string; version: number; crlf: boolean };
 /** Pre-event host coordinates, paired with a synchronously captured post-event snapshot. */
 export type HostDocumentChange = {
@@ -58,9 +58,20 @@ export class LivePreviewEditCoordinator<Document extends EditDocument, Peer exte
 
   constructor(private readonly options: EditOptions<Document, Peer>) {}
 
-  async initialize(document: Document, deliver: (snapshot: { text: string; version: number; syncVersion: number }) => void): Promise<void> {
+  async initialize(
+    document: Document,
+    deliver: (snapshot: { text: string; version: number; syncVersion: number }) => void,
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> {
     const key = document.uri.toString();
-    await this.options.editQueue.drain(key);
+    const queue = this.options.editQueue;
+    let tail: Promise<unknown>;
+    do {
+      tail = queue.idle(key);
+      await queue.drain(key);
+      // Another edit can arrive between the drain check and this continuation.
+    } while (queue.idle(key) !== tail);
+    if (!isCurrent()) return;
     const snapshot = this.options.host.read(document);
     const authority = this.authority(document, snapshot);
     // Delivery and caller readiness happen in this turn, without another await.

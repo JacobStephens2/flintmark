@@ -1,7 +1,7 @@
 import { SerialQueue } from "./serialQueue";
 import type { HostMsg } from "../shared/protocol";
 
-type SaveDocument = {
+export type SaveDocument = {
   readonly uri: { toString(): string };
   readonly isClosed: boolean;
   readonly isDirty: boolean;
@@ -14,7 +14,7 @@ type SavePeer = {
 };
 type SaveOptions<Document, Peer> = {
   editQueue: SerialQueue;
-  /** Undefined means the provider has no panels for this document. */
+  /** Undefined means there are no registered peers for this document. */
   readyPeers(key: string): readonly Peer[] | undefined;
   hasConflicts(key: string): boolean;
   forceSave(document: Document): PromiseLike<unknown>;

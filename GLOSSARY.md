@@ -29,6 +29,15 @@ recovery, and supplies conflict state to the Save barrier.
 The [Live Preview edit module](src/extension/livePreviewEditCoordinator.ts) owns
 this protocol behind a host-independent interface.
 
+## Live Preview synchronization
+
+The host-side process that tracks registered and ready preview peers and orders
+received edits, native undo and redo, and save persistence for each TextDocument.
+
+The [Live Preview synchronization module](src/extension/livePreviewSynchronization.ts)
+composes [Live Preview edit synchronization](#live-preview-edit-synchronization)
+and the [Save barrier](#save-barrier).
+
 ## Note-folder creation
 
 The shared operation that derives a destination beside a note and creates a
