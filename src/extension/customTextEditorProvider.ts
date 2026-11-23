@@ -1,7 +1,7 @@
 import { noteLinkTarget, noteLinkCandidates } from "./noteLinkTarget";
 import * as vscode from "vscode";
-import { LivePreviewEditCoordinator } from "./livePreviewEditCoordinator";
-import { LivePreviewEditHost, hostDocumentChanges } from "./livePreviewEditHost";
+import type { LivePreviewSynchronization } from "./livePreviewSynchronization";
+import { createLivePreviewSynchronization } from "./livePreviewSynchronizationHost";
 import { VaultIndexService } from "./vault";
 import { ImageIndexService } from "./vault/imageIndexService";
 import { DEFAULT_THEME_ID, findTheme } from "./themes";
@@ -10,8 +10,6 @@ import { aiLog } from "./ai/aiLog";
 import { clampOffsetRange, cmToHostOffsets } from "../shared/ranges";
 import { DEFAULT_LINE_WIDTH, normalizeSettings } from "../shared/settings";
 import { createNoteFolderCreation } from "./vault/noteFolderCreationHost";
-import { SerialQueue } from "./serialQueue";
-import { LivePreviewSaveCoordinator } from "./livePreviewSaveCoordinator";
 import { createLivePreviewImagePublication } from "./livePreviewImageHost";
 import type { LivePreviewImagePublication } from "./livePreviewImagePublication";
 import type {
@@ -86,47 +84,18 @@ export class OfmCustomTextEditorProvider
   private panels: Map<string, Map<vscode.WebviewPanel, PanelRecord>> =
     new Map();
 
-  /** Serializes webview edits per URI — the concurrent-edit corruption guard. */
-  private editQueue = new SerialQueue();
-  private readonly edits = new LivePreviewEditCoordinator<vscode.TextDocument, vscode.WebviewPanel>({
-    editQueue: this.editQueue,
-    host: new LivePreviewEditHost(),
-    registeredPeers: uri => this.panels.has(uri) ? [...this.panels.get(uri)!.keys()] : undefined,
-    readyPeers: uri => this.readyPeers(uri),
-    notifyConflict: document => this.notifyConflict(document),
-    notifyRecovery: uri => {
-      void vscode.window.showWarningMessage(
-        "This file changed while closed. Flintmark preserved your unsynchronized edits in a recovery copy.",
-        "Open Recovery Copy",
-      ).then(action => { if (action) void this.openRecoveryCopy(uri); });
-    },
-  });
-  private readonly saves = new LivePreviewSaveCoordinator<vscode.TextDocument, vscode.WebviewPanel>({
-    editQueue: this.editQueue,
-    readyPeers: uri => this.readyPeers(uri),
-    hasConflicts: uri => this.edits.hasConflicts(uri),
-    forceSave: document => vscode.commands.executeCommand("workbench.action.files.save", document.uri),
-    reportError: error => this.reportSaveError(error),
-  });
+  private readonly synchronization: LivePreviewSynchronization<vscode.TextDocument, vscode.WebviewPanel>;
 
   /** Extension-owned saves must enter here, never call TextDocument.save()
    * before synchronization: that API skips clean host documents entirely. */
   async saveDocument(document: vscode.TextDocument): Promise<boolean> {
-    return this.saves.saveDocument(document);
+    return this.synchronization.saveDocument(document);
   }
 
   private reportSaveError(error: unknown): void {
     void vscode.window.showErrorMessage("Flintmark could not finish saving: " + String(error));
   }
   private conflictNotifications = new Set<string>();
-
-  private readyPeers(uri: string): vscode.WebviewPanel[] | undefined {
-    const panels = this.panels.get(uri);
-    return panels && [...panels.keys()].filter(panel => this.readyPanels.has(panel));
-  }
-
-  /** Panels that completed the webview ready/init handshake. */
-  private readyPanels = new WeakSet<vscode.WebviewPanel>();
 
   /** Last requested source position for a document whose webview is opening. */
   private pendingReveals = new Map<string, { line: number; character: number }>();
@@ -136,20 +105,19 @@ export class OfmCustomTextEditorProvider
     private readonly vault?: VaultIndexService,
     private readonly imageIndex?: ImageIndexService
   ) {
-    // Global listener: reconcile external document changes into webviews.
-    this.context.subscriptions.push(
-      this.saves,
-      vscode.workspace.onDidChangeTextDocument((e) =>
-        this.onDocumentChanged(e)
-      ),
-      vscode.workspace.onWillSaveTextDocument((e) => {
-        const wait = this.saves.participateNativeSave(e.document);
-        if (wait) e.waitUntil(wait.then(() => []));
-      }),
-      vscode.workspace.onDidSaveTextDocument(document => {
-        void this.saves.completeNativeSave(document);
-      })
-    );
+    const host = createLivePreviewSynchronization<vscode.WebviewPanel>({
+      beforeDocumentChange: document => this.refreshDocumentImages(document),
+      notifyConflict: document => this.notifyConflict(document),
+      notifyRecovery: uri => {
+        void vscode.window.showWarningMessage(
+          "This file changed while closed. Flintmark preserved your unsynchronized edits in a recovery copy.",
+          "Open Recovery Copy",
+        ).then(action => { if (action) void this.openRecoveryCopy(uri); });
+      },
+      reportError: error => this.reportSaveError(error),
+    });
+    this.synchronization = host.synchronization;
+    this.context.subscriptions.push(host);
 
     // When the image index (re)builds — initial scan finishing, or an attachment
     // added/removed while a note's text is unchanged — recompute the image map
@@ -243,7 +211,6 @@ export class OfmCustomTextEditorProvider
   ): Promise<void> {
     const uri = document.uri.toString();
 
-    // Register panel so we can route external changes to it.
     let panelsForUri = this.panels.get(uri);
     if (!panelsForUri) {
       panelsForUri = new Map();
@@ -251,32 +218,26 @@ export class OfmCustomTextEditorProvider
     }
     const imagePublication = createLivePreviewImagePublication(document, webviewPanel.webview, this.imageIndex);
     panelsForUri.set(webviewPanel, { document, panel: webviewPanel, imagePublication });
-    webviewPanel.onDidDispose(() => {
-      imagePublication.dispose();
-      this.saves.cancelPeer(webviewPanel);
-      const records = this.panels.get(uri);
-      records?.delete(webviewPanel);
-      if (records?.size === 0) {
-        this.panels.delete(uri);
-        this.edits.lastPeerClosed(uri);
-      }
-      this.readyPanels.delete(webviewPanel);
-      if (records?.size === 0) this.pendingReveals.delete(uri);
-    });
-
-    // Configure webview
+    this.synchronization.registerPeer(document, webviewPanel);
     webviewPanel.webview.options = {
       enableScripts: true,
       localResourceRoots: this.resourceRoots(document),
     };
-    webviewPanel.webview.html = this.buildHtml(webviewPanel.webview);
-
-    // Handle messages from the webview
-    webviewPanel.webview.onDidReceiveMessage(
-      (msg: WebviewMsg) => this.onWebviewMessage(document, webviewPanel, msg),
-      undefined,
-      this.context.subscriptions
+    const messages = webviewPanel.webview.onDidReceiveMessage(
+      (msg: WebviewMsg) => this.onWebviewMessage(document, webviewPanel, msg)
     );
+    webviewPanel.onDidDispose(() => {
+      messages.dispose();
+      imagePublication.dispose();
+      this.synchronization.unregisterPeer(document, webviewPanel);
+      const records = this.panels.get(uri);
+      records?.delete(webviewPanel);
+      if (records?.size === 0) {
+        this.panels.delete(uri);
+        this.pendingReveals.delete(uri);
+      }
+    });
+    webviewPanel.webview.html = this.buildHtml(webviewPanel.webview);
   }
 
   // -----------------------------------------------------------------------
@@ -352,15 +313,18 @@ export class OfmCustomTextEditorProvider
   ): Promise<void> {
     switch (msg.type) {
       case "flushed": {
-        this.saves.acknowledge(panel, msg.requestId);
+        this.synchronization.acknowledgeFlush(panel, msg.requestId);
         return;
       }
       case "ready":
-        return this.edits.initialize(document, snapshot => this.handleReady(document, panel, snapshot));
+        return this.synchronization.initializePeer(document, panel, () => ({
+          settings: readSettings(),
+          theme: this.buildThemePayload(panel.webview),
+          vault: this.vault?.getVaultData(),
+        }), () => this.afterReady(document, panel));
 
       case "edit":
-        // Serialize: never apply concurrently (fast typing would race/corrupt).
-        this.edits.submit(document, panel, msg);
+        this.synchronization.submitEdit(document, panel, msg);
         return;
 
       case "requestSave":
@@ -370,16 +334,10 @@ export class OfmCustomTextEditorProvider
         return;
 
       case "requestUndo":
-        await this.editQueue.run(document.uri.toString(), async () => {
-          await vscode.commands.executeCommand("undo");
-        });
-        return;
+        return this.synchronization.runHistoryCommand(document, "undo");
 
       case "requestRedo":
-        await this.editQueue.run(document.uri.toString(), async () => {
-          await vscode.commands.executeCommand("redo");
-        });
-        return;
+        return this.synchronization.runHistoryCommand(document, "redo");
 
       case "selectionChanged":
         // Slice 1: receive but do nothing (Selection Bridge seat).
@@ -411,41 +369,22 @@ export class OfmCustomTextEditorProvider
   }
 
   // -----------------------------------------------------------------------
-  // Handle ready → send init with full document text
+  // Presentation after the ready handshake
   // -----------------------------------------------------------------------
 
-  private handleReady(
-    document: vscode.TextDocument,
-    panel: vscode.WebviewPanel,
-    snapshot: { text: string; version: number; syncVersion: number },
-  ): void {
-    const settings: Settings = readSettings();
-    const theme = this.buildThemePayload(panel.webview);
-
-    const initMsg: HostMsg = {
-      type: "init",
-      syncVersion: snapshot.syncVersion,
-      uri: document.uri.toString(),
-      version: snapshot.version,
-      text: snapshot.text,
-      settings,
-      theme,
-      vault: this.vault?.getVaultData(),
-    };
-
-    panel.webview.postMessage(initMsg);
-    this.readyPanels.add(panel);
-    const pendingReveal = this.pendingReveals.get(document.uri.toString());
+  private afterReady(document: vscode.TextDocument, panel: vscode.WebviewPanel): void {
+    const uri = document.uri.toString();
+    const pendingReveal = this.pendingReveals.get(uri);
     if (pendingReveal) {
-      this.pendingReveals.delete(document.uri.toString());
+      this.pendingReveals.delete(uri);
       this.postReveal(panel, pendingReveal.line, pendingReveal.character);
     }
     this.imageIndex?.ensureFreshForDocument(document.uri, "webview-ready");
-    this.panels.get(document.uri.toString())?.get(panel)?.imagePublication.ready();
+    this.panels.get(uri)?.get(panel)?.imagePublication.ready();
   }
 
   private async openRecoveryCopy(uri: string): Promise<void> {
-    for (const text of this.edits.recoveryTexts(uri)) {
+    for (const text of this.synchronization.recoveryTexts(uri)) {
       const copy = await vscode.workspace.openTextDocument({ language: "markdown", content: text });
       await vscode.window.showTextDocument(copy, { preview: false });
     }
@@ -453,7 +392,7 @@ export class OfmCustomTextEditorProvider
 
   private async retryConflicts(document: vscode.TextDocument): Promise<void> {
     const current = document.isClosed ? await vscode.workspace.openTextDocument(document.uri) : document;
-    this.edits.retry(current);
+    this.synchronization.retry(current);
   }
 
   private notifyConflict(document: vscode.TextDocument): void {
@@ -803,7 +742,7 @@ export class OfmCustomTextEditorProvider
 
     if (record) {
       record.panel.reveal(record.panel.viewColumn, false);
-      if (this.readyPanels.has(record.panel)) {
+      if (this.synchronization.isReady(key, record.panel)) {
         this.postReveal(record.panel, line, character);
       } else {
         this.pendingReveals.set(key, { line, character });
@@ -835,13 +774,13 @@ export class OfmCustomTextEditorProvider
       }
       // Live → Code can leave a ready but hidden panel record briefly alive.
       // `openWith` may reveal/reuse it without another ready handshake, so drain
-      // the pending request here when handleReady did not already consume it.
+      // the pending request here when the ready follow-up did not consume it.
       const pending = this.pendingReveals.get(key);
       if (pending) {
         const opened = [...(this.panels.get(key)?.values() ?? [])].find(
           (candidate) => candidate.panel.active || candidate.panel.visible
         );
-        if (opened && this.readyPanels.has(opened.panel)) {
+        if (opened && this.synchronization.isReady(key, opened.panel)) {
           this.pendingReveals.delete(key);
           this.postReveal(opened.panel, pending.line, pending.character);
         }
@@ -925,11 +864,11 @@ export class OfmCustomTextEditorProvider
   }
 
   // -----------------------------------------------------------------------
-  // onDidChangeTextDocument → reconcile external changes into webview
+  // Refresh per-panel images before synchronization processes the change
   // -----------------------------------------------------------------------
 
-  private onDocumentChanged(e: vscode.TextDocumentChangeEvent): void {
-    const uri = e.document.uri.toString();
+  private refreshDocumentImages(document: vscode.TextDocument): void {
+    const uri = document.uri.toString();
     const records = [...(this.panels.get(uri)?.values() ?? [])];
 
     // Refresh image resolution on every change (images can be typed/edited);
@@ -938,6 +877,5 @@ export class OfmCustomTextEditorProvider
       imagePublication.refresh();
     }
 
-    this.edits.observe(e.document, hostDocumentChanges(e));
   }
 }

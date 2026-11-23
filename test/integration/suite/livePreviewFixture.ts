@@ -1,47 +1,45 @@
 import * as vscode from "vscode";
-import { LivePreviewEditCoordinator } from "../../../src/extension/livePreviewEditCoordinator";
-import { LivePreviewEditHost, hostDocumentChanges } from "../../../src/extension/livePreviewEditHost";
-import { LivePreviewSaveCoordinator } from "../../../src/extension/livePreviewSaveCoordinator";
-import { SerialQueue } from "../../../src/extension/serialQueue";
+import { LivePreviewEditHost } from "../../../src/extension/livePreviewEditHost";
+import { createLivePreviewSynchronization } from "../../../src/extension/livePreviewSynchronizationHost";
+import type { LivePreviewSynchronizationOptions } from "../../../src/extension/livePreviewSynchronization";
 import type { HostMsg } from "../../../src/shared/protocol";
 
-type Peer = { webview: { postMessage(message: HostMsg): boolean | PromiseLike<boolean> } };
+export type Peer = { webview: { postMessage(message: HostMsg): boolean | PromiseLike<boolean> } };
 
-/** Simulate only panel transport; keep the concrete host, queue and both protocols. */
-export function livePreviewFixture(document: vscode.TextDocument, subscriptions: vscode.Disposable[]) {
-  const queue = new SerialQueue(), peers = new Set<Peer>();
+/** Simulate panel transport while using the production TextDocument adapter. */
+export function livePreviewFixture(
+  document: vscode.TextDocument,
+  subscriptions: vscode.Disposable[],
+  executeHistory?: LivePreviewSynchronizationOptions<vscode.TextDocument>["executeHistory"],
+) {
   const concrete = new LivePreviewEditHost();
-  const host = {
-    read: (doc: vscode.TextDocument) => concrete.read(doc),
-    apply: (doc: vscode.TextDocument, changes: Parameters<LivePreviewEditHost["apply"]>[1]) => concrete.apply(doc, changes),
-  };
-  const currentPeers = (key: string) => key === document.uri.toString() ? [...peers] : undefined;
-  const edits = new LivePreviewEditCoordinator<vscode.TextDocument, Peer>({
-    editQueue: queue, host, registeredPeers: currentPeers, readyPeers: currentPeers,
-    notifyConflict: () => {}, notifyRecovery: () => {},
-  });
-  const saves = new LivePreviewSaveCoordinator<vscode.TextDocument, Peer>({
-    editQueue: queue, readyPeers: currentPeers, hasConflicts: key => edits.hasConflicts(key),
-    forceSave: doc => vscode.commands.executeCommand("workbench.action.files.save", doc.uri),
+  const host = { read: concrete.read.bind(concrete), apply: concrete.apply.bind(concrete) };
+  const adapter = createLivePreviewSynchronization<Peer>({
+    host,
+    executeHistory,
+    notifyConflict: () => {},
+    notifyRecovery: () => {},
     reportError: error => { console.error("[integration] save failure", error); },
   });
-  subscriptions.push(saves,
-    vscode.workspace.onDidChangeTextDocument(event => {
-      if (event.document === document) edits.observe(event.document, hostDocumentChanges(event));
-    }),
-    vscode.workspace.onWillSaveTextDocument(event => {
-      if (event.document !== document) return;
-      const wait = saves.participateNativeSave(event.document);
-      if (wait) event.waitUntil(wait.then(() => []));
-    }),
-    vscode.workspace.onDidSaveTextDocument(doc => { if (doc === document) void saves.completeNativeSave(doc); }),
-  );
+  subscriptions.push(adapter);
+  const { synchronization } = adapter;
   return {
-    edits, saves, host, queue,
-    addPeer: (peer: Peer) => { peers.add(peer); },
-    closePeer: (peer: Peer) => {
-      peers.delete(peer); saves.cancelPeer(peer);
-      if (!peers.size) edits.lastPeerClosed(document.uri.toString());
+    synchronization,
+    host,
+    async openPeer(peer: Peer) {
+      synchronization.registerPeer(document, peer);
+      await synchronization.initializePeer(document, peer, () => ({
+        settings: {},
+        theme: { id: "integration", cssUri: null },
+      }));
     },
   };
+}
+
+export async function waitForSynchronization(accepted: () => boolean, description: string): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (!accepted()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for " + description);
+    await new Promise<void>(resolve => setTimeout(resolve, 20));
+  }
 }
