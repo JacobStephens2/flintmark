@@ -129,7 +129,24 @@ test("release version check fails when HEAD is not an ancestor of origin/main", 
     commitFile(cwd, "side.txt", "side\n");
     const result = checkReleaseCheckout(cwd);
     assert.notEqual(result.status, 0);
-    assert.match(`${result.stdout}\n${result.stderr}`, /not an ancestor of origin\/main/);
+    assert.match(`${result.stdout}\n${result.stderr}`, /not an ancestor of refs\/remotes\/origin\/main/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("release version check fails when a tag named origin/main hides refs/remotes/origin/main", () => {
+  const cwd = initRepo();
+  try {
+    git(cwd, ["checkout", "-b", "not-main"]);
+    commitFile(cwd, "side.txt", "side\n");
+    // fetch-depth 0 stores every remote tag at refs/tags/*, which git resolves
+    // before refs/remotes/origin/main. The real main ref stays where the
+    // release step fetched it.
+    git(cwd, ["tag", "origin/main"]);
+    const result = checkReleaseCheckout(cwd);
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /not an ancestor of refs\/remotes\/origin\/main/);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -141,7 +158,7 @@ test("release version check fails when origin/main is unavailable", () => {
     git(cwd, ["update-ref", "-d", "refs/remotes/origin/main"]);
     const result = checkReleaseCheckout(cwd);
     assert.notEqual(result.status, 0);
-    assert.match(`${result.stdout}\n${result.stderr}`, /origin\/main/);
+    assert.match(`${result.stdout}\n${result.stderr}`, /refs\/remotes\/origin\/main/);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

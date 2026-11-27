@@ -1,7 +1,9 @@
 import { execFileSync } from "node:child_process";
 
-// Fixed on purpose. A caller-supplied ref could name HEAD and pass for every checkout.
-const mainRef = "origin/main";
+// Full remote-tracking name on purpose. Git resolves a tag or local branch
+// named origin/main before refs/remotes/origin/main, and the release checkout
+// fetches every tag. A caller-supplied ref could also name HEAD and pass.
+const mainRef = "refs/remotes/origin/main";
 
 function git(args) {
   return execFileSync("git", args, {
