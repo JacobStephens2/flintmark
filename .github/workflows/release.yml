@@ -10,8 +10,9 @@
 # Flow: verify VS Code -> package a clean VSIX -> validate -> publish GitHub Release.
 # Marketplace publication requires an explicit manual dispatch opt-in and a PAT.
 #
-# The `marketplace` GitHub Environment limits access to the PAT to `main` and
-# version tags. See .github/RELEASING.md.
+# The marketplace environment does not treat every `v*` tag as a deployment
+# target: a version tag qualifies only when its commit is on `main`, and
+# Marketplace auth check runs only on `main`. See .github/RELEASING.md.
 name: Release
 
 on:
@@ -52,11 +53,12 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-      - run: npm ci
 
       - name: Resolve version + assert tag matches package.json
         id: ver
@@ -79,9 +81,16 @@ jobs:
             echo "::error::for a manual re-run, select the existing ${TAG} tag as the workflow ref"
             exit 1
           fi
+          if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+            git fetch --force --unshallow origin
+          fi
+          git fetch --force origin refs/heads/main:refs/remotes/origin/main
+          node scripts/check-release-checkout.mjs
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${PKG}" >> "$GITHUB_OUTPUT"
           echo "Releasing ${TAG}"
+
+      - run: npm ci
 
       - name: Download the exact candidate accepted on every platform
         uses: actions/download-artifact@v4
