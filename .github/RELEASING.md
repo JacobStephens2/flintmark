@@ -17,8 +17,10 @@ release pipeline and builds the VSIX from a clean tagged checkout.
    - Scopes: **Custom defined -> Show all scopes -> Marketplace -> Manage**
 
 3. Copy the PAT when it is displayed. Azure DevOps does not show it again.
-4. In GitHub, open **Settings -> Environments -> marketplace**. The environment
-   must allow only the `main` branch and tags matching `v*`.
+4. In GitHub, open **Settings -> Environments -> marketplace**. The marketplace
+   environment does not treat every `v*` tag as a deployment target: a version
+   tag qualifies only when its commit is on `main`, and Marketplace auth check
+   runs only on `main`.
 5. Add an environment secret named `VSCE_PAT` containing the PAT.
 6. Run **Actions -> Marketplace auth check -> Run workflow** on `main`. It is
    ready when `vsce verify-pat quboliu` succeeds.
@@ -73,8 +75,8 @@ manually run **Release** on the existing version tag and explicitly select
 to off. An opted-in run verifies publisher access and publishes the same VSIX
 when VSCE_PAT is available; otherwise Marketplace publishing is skipped.
 
-Run **Marketplace auth check** before tagging only when automated Marketplace
-publishing is expected.
+Run **Marketplace auth check** on `main` before tagging only when automated
+Marketplace publishing is expected.
 
 ## Manual Marketplace upload
 
